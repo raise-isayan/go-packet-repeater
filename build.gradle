@@ -1,0 +1,297 @@
+/*
+ * Cross-platform Go build script (Windows / Linux / macOS).
+ * Run identically on every OS via the Gradle Wrapper:
+ *   ./gradlew goBuildAll      (Linux / macOS)
+ *   gradlew.bat goBuildAll    (Windows)
+ *
+ * build        -> plain "go build -o gopr ./cmd/gopr" for the host
+ *                 OS/architecture only (no GOOS/GOARCH override, no
+ *                 cross-compilation). Mirrors running the command by hand.
+ * goBuildAll   -> cross-compiles ./cmd/gopr for every target GOOS/GOARCH
+ *                 pair below and writes the binaries into dist/. Build
+ *                 only; already-built binaries are skipped, nothing is
+ *                 zipped here.
+ * goReleaseAll -> zips every binary from dist/ into release/ (one zip
+ *                 per target). Depends on goBuildAll, so any missing
+ *                 binary is built first automatically; binaries already
+ *                 in dist/ are reused as-is.
+ */
+
+def appName = "${APP_NAME}"
+def appVersion = "${VERSION_NAME}"
+def srcPath = './cmd/gopr'
+def distDir = new File(rootDir, 'dist')
+def releaseDir = new File(rootDir, 'release')
+def rootProjectDir = rootDir
+
+def targetBin = {
+  def isWindows = System.getProperty('os.name').toLowerCase().contains('windows')
+  def binFile = new File(rootProjectDir, isWindows ? "${appName}.exe" : appName)
+  return binFile
+}
+
+
+// Project.exec(Closure) was removed in Gradle 9 (it was deprecated in favor
+// of the injected ExecOperations service), so it can no longer be used here
+// -- neither as a bare "exec { ... }" nor as "proj.exec { ... }". Shelling
+// out via java.lang.ProcessBuilder instead avoids depending on Gradle's exec
+// API entirely, so it keeps working regardless of Gradle version.
+def runGoBuild = { String goos, String goarch, File binFile, Map<String, String> extraEnv = [:] ->
+    def pb = new ProcessBuilder('go', 'build', '-ldflags', "-X main.version=${appVersion}", '-o', binFile.absolutePath, srcPath)
+    pb.directory(rootProjectDir)
+    pb.redirectErrorStream(true)
+    pb.environment().put('GOOS', goos)
+    pb.environment().put('GOARCH', goarch)
+    pb.environment().put('CGO_ENABLED', '0')
+    extraEnv.each { k, v -> pb.environment().put(k, v) }
+
+    def process = pb.start()
+    process.inputStream.eachLine { line -> println "    ${line}" }
+    return process.waitFor()
+}
+
+// Android needs CGO_ENABLED=1 (Go's pure-Go DNS resolver can't read a usable
+// /etc/resolv.conf on Android and falls back to querying 127.0.0.1:53 /
+// [::1]:53, which nothing listens on -> "connection refused" for every
+// hostname lookup). CGO requires a matching Android NDK clang per target
+// arch, so we auto-detect an NDK under %ANDROID_HOME%/ndk (or
+// $ANDROID_HOME/ndk) and resolve the right compiler for each arch/API
+// level. If no usable NDK is found, android/* targets are skipped rather
+// than failing the whole build.
+def androidNdkApi = project.hasProperty('androidNdkApi') ? "${androidNdkApi}" : '21'
+
+def androidTriples = [
+    '386'  : 'i686-linux-android',
+    'amd64': 'x86_64-linux-android',
+    'arm'  : 'armv7a-linux-androideabi',
+    'arm64': 'aarch64-linux-android',
+]
+
+def findAndroidNdkBin = {
+    def sdkHome = System.getenv('ANDROID_HOME') ?: System.getenv('ANDROID_SDK_ROOT')
+    if (!sdkHome) {
+        println "Android NDK: ANDROID_HOME/ANDROID_SDK_ROOT is not set -- android/* targets will be skipped."
+        return null
+    }
+    def ndkRoot = new File(sdkHome, 'ndk')
+    if (!ndkRoot.isDirectory()) {
+        println "Android NDK: no 'ndk' directory under ${sdkHome} -- install it via the SDK Manager (\"NDK (Side by side)\"). android/* targets will be skipped."
+        return null
+    }
+    def versions = ndkRoot.listFiles({ f -> f.isDirectory() } as FileFilter)
+    if (!versions || versions.length == 0) {
+        println "Android NDK: ${ndkRoot} exists but contains no NDK version -- android/* targets will be skipped."
+        return null
+    }
+    // Pick the highest-numbered installed NDK (numeric compare on dotted version dirs).
+    def newest = versions.sort { a, b ->
+        def av = a.name.split('\\.').collect { it.isInteger() ? it.toInteger() : 0 }
+        def bv = b.name.split('\\.').collect { it.isInteger() ? it.toInteger() : 0 }
+        [av, bv].transpose().findResult { x, y -> x <=> y ?: null } ?: (av.size() <=> bv.size())
+    }.last()
+
+    def osName = System.getProperty('os.name').toLowerCase()
+    def hostTag = osName.contains('windows') ? 'windows-x86_64' :
+                  osName.contains('mac') ? 'darwin-x86_64' : 'linux-x86_64'
+    def bin = new File(newest, "toolchains/llvm/prebuilt/${hostTag}/bin")
+    if (!bin.isDirectory()) {
+        println "Android NDK: toolchain dir not found at ${bin} -- android/* targets will be skipped."
+        return null
+    }
+    println "Android NDK: using ${newest} (host=${hostTag}, API=${androidNdkApi})"
+    return bin
+}
+
+def androidNdkBin = findAndroidNdkBin()
+def androidCmdExt = System.getProperty('os.name').toLowerCase().contains('windows') ? '.cmd' : ''
+
+// Returns extra env vars (CGO_ENABLED/CC/GOARM) for an android/<goarch>
+// target, or null if no usable compiler was found for it (caller should
+// skip the target in that case).
+def androidExtraEnv = { String goarch ->
+    if (androidNdkBin == null) return null
+    def triple = androidTriples[goarch]
+    if (triple == null) return null
+    def cc = new File(androidNdkBin, "${triple}${androidNdkApi}-clang${androidCmdExt}")
+    if (!cc.isFile()) {
+        println "  Android NDK: compiler not found: ${cc}"
+        return null
+    }
+    def env = ['CGO_ENABLED': '1', 'CC': cc.absolutePath]
+    if (goarch == 'arm') env['GOARM'] = '7'
+    return env
+}
+
+def targets = [
+    'android/386', 'android/amd64', 'android/arm', 'android/arm64',
+    'darwin/amd64', 'darwin/arm64',
+    'freebsd/386', 'freebsd/amd64', 'freebsd/arm', 'freebsd/arm64',
+    'linux/386', 'linux/amd64', 'linux/arm', 'linux/arm64', 'linux/loong64',
+    'linux/mips', 'linux/mips64', 'linux/mips64le', 'linux/mipsle',
+    'linux/ppc64', 'linux/ppc64le', 'linux/riscv64', 'linux/s390x',
+    'windows/386', 'windows/amd64', 'windows/arm64'
+]
+
+// NOTE: a plain "def binFileFor(...) { ... }" method does NOT capture local
+// script variables like appName (methods aren't closures in Groovy scripts).
+// Using a closure here instead so it can see appName/distDir/etc.
+def binFileFor = { File dir, String goos, String goarch ->
+    def ext = (goos == 'windows') ? '.exe' : ''
+    new File(dir, "${appName}-${goos}-${goarch}-${appVersion}${ext}")
+}
+
+tasks.register('build') {
+    group = 'build'
+    description = "Plain 'go build -o ${appName} ${srcPath}' for the host OS/architecture (no cross-compilation)."
+
+    doLast {
+        def binFile = targetBin()
+
+        println "Building ${binFile} ..."
+        def pb = new ProcessBuilder('go', 'build', '-ldflags', "-X main.version=${appVersion}", '-o', binFile.absolutePath, srcPath)
+        pb.directory(rootProjectDir)
+        pb.redirectErrorStream(true)
+
+        def process = pb.start()
+        process.inputStream.eachLine { line -> println "    ${line}" }
+        def exitValue = process.waitFor()
+
+        if (exitValue != 0) {
+            throw new GradleException("go build failed (exit ${exitValue})")
+        }
+        println "OK: ${binFile}"
+    }
+}
+
+tasks.register('test') {
+    group = 'verification'
+    description = "Runs 'go test -v ./...' for the whole module."
+
+    doLast {
+        def pb = new ProcessBuilder('go', 'test', '-v', './...')
+        pb.directory(rootProjectDir)
+        pb.redirectErrorStream(true)
+
+        def process = pb.start()
+        process.inputStream.eachLine { line -> println line }
+        def exitValue = process.waitFor()
+
+        if (exitValue != 0) {
+            throw new GradleException("go test failed (exit ${exitValue})")
+        }
+    }
+}
+
+tasks.register('goBuildAll') {
+    group = 'build'
+    description = "Cross-compiles ${appName} for every target GOOS/GOARCH into ${distDir.name}/."
+
+    doLast {
+        distDir.mkdirs()
+
+        int builtCount = 0
+        int skipCount = 0
+        int failCount = 0
+
+        targets.each { target ->
+            def (goos, goarch) = target.split('/')
+            def binFile = binFileFor(distDir, goos, goarch)
+
+            if (binFile.exists()) {
+                println "Skip (already built): ${binFile}"
+                skipCount++
+                return
+            }
+
+            def extraEnv = [:]
+            if (goos == 'android') {
+                extraEnv = androidExtraEnv(goarch)
+                if (extraEnv == null) {
+                    println "Skip (no Android NDK toolchain for ${goarch}): ${binFile}"
+                    skipCount++
+                    return
+                }
+            }
+
+            println "Building ${binFile} ..."
+            def exitValue = runGoBuild(goos, goarch, binFile, extraEnv)
+
+            if (exitValue != 0) {
+                println "  FAILED: ${goos}/${goarch}"
+                failCount++
+            } else {
+                println "  OK: ${binFile}"
+                builtCount++
+            }
+        }
+
+        println ""
+        println "Done. Built: ${builtCount}  Skipped: ${skipCount}  Failed: ${failCount}"
+        println "Binaries are in: ${distDir}"
+        println "NOTE: cgo-dependent code paths (e.g. gopacket/pcap) may fail to"
+        println "cross-compile under CGO_ENABLED=0 and may need a native-host build."
+        println "NOTE: android/* targets require an installed Android NDK under"
+        println "%ANDROID_HOME%/ndk (or \$ANDROID_HOME/ndk); if none is found they are skipped"
+    }
+}
+
+tasks.register('goReleaseAll') {
+    group = 'build'
+    description = "Zips every binary from ${distDir.name}/ into ${releaseDir.name}/ (builds missing binaries first)."
+    dependsOn 'goBuildAll'
+
+    doLast {
+        releaseDir.mkdirs()
+
+        int zipCount = 0
+        int missingCount = 0
+
+        targets.each { target ->
+            def (goos, goarch) = target.split('/')
+            def binFile = binFileFor(distDir, goos, goarch)
+
+            if (!binFile.exists()) {
+                println "  MISSING (build failed?): ${binFile}"
+                missingCount++
+                return
+            }
+
+            def zipFile = new File(releaseDir, "${appName}-${goos}-${goarch}-${appVersion}.zip")
+            println "Zipping ${zipFile} ..."
+            ant.zip(destfile: zipFile.absolutePath) {
+                fileset(file: binFile.absolutePath)
+            }
+            zipCount++
+        }
+
+        println ""
+        println "Done. Zipped: ${zipCount}  Missing: ${missingCount}"
+        println "Archives are in: ${releaseDir}"
+    }
+}
+
+tasks.register('cleanl', Delete) {
+    group = 'build'
+    description = "Removes the output all directory."
+    def binFile = targetBin()
+    delete binFile
+}
+
+tasks.register('cleanAll', Delete) {
+    group = 'build'
+    description = "Removes the output all directory."
+    dependsOn 'cleanDist'
+    dependsOn 'cleanRelease'
+}
+
+tasks.register('cleanDist', Delete) {
+    group = 'build'
+    description = "Removes the ${distDir.name} output directory."
+    delete distDir
+}
+
+tasks.register('cleanRelease', Delete) {
+    group = 'build'
+    description = "Removes the ${releaseDir.name} output directory."
+    delete releaseDir
+}
