@@ -25,8 +25,9 @@ type Endpoint struct {
 	// (e.g. "192.168.0.2:7777", "[2001:db8::2]:7777", "0.0.0.0:8888").
 	Addr string
 	// TCP and UDP report which protocols this relay operates over. These
-	// are computed jointly across both endpoints (see Parse), so Target.TCP
-	// always equals Listen.TCP, and likewise for UDP.
+	// are declared on the listen side only (see Parse) and mirrored onto
+	// both endpoints, so Target.TCP always equals Listen.TCP, and likewise
+	// for UDP.
 	TCP bool
 	UDP bool
 	// SSL reports whether this specific side is encrypted: TLS over its
@@ -47,6 +48,16 @@ type Config struct {
 	// ModeForward, and the proxy's listen address in ModeHTTPProxy /
 	// ModeSOCKSProxy.
 	Listen Endpoint
+
+	// UpstreamAddr, when non-empty, chains this proxy to an upstream
+	// proxy/SOCKS server of the same kind instead of dialing the client's
+	// requested destination directly: an HTTP CONNECT (or plain request)
+	// is relayed through it in ModeHTTPProxy, and a SOCKS5 CONNECT in
+	// ModeSOCKSProxy. Only set when Mode is ModeHTTPProxy or
+	// ModeSOCKSProxy and <target> was given as "<host:port>/proxy" or
+	// "<host:port>/socks"; empty for the bare "proxy"/"socks" keyword
+	// form, which dials directly as before.
+	UpstreamAddr string
 
 	KeyPath  string
 	CertPath string

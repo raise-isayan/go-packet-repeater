@@ -117,9 +117,12 @@ func Parse(args []string) (*Config, error) {
 	}
 	targetTok, listenTok := rest[0], rest[1]
 
-	if mode, ok := proxyMode(targetTok); ok {
-		if opts.keyPath != "" || opts.certPath != "" || opts.caPath != "" || opts.signCAPath != "" || opts.serverName != "" {
-			return nil, errors.New("proxy/socks mode cannot be combined with -key=/-cert=/-ca=/-signca=/-servername=")
+	if mode, upstream, isProxy, perr := classifyProxyTarget(targetTok); isProxy {
+		if perr != nil {
+			return nil, perr
+		}
+		if opts.keyPath != "" || opts.certPath != "" || opts.caPath != "" || opts.verifySet || opts.signCAPath != "" || opts.serverName != "" {
+			return nil, errors.New("proxy/socks mode cannot be combined with -key=/-cert=/-ca=/-verify=/-signca=/-servername=")
 		}
 		if strings.Contains(listenTok, "/") {
 			return nil, fmt.Errorf("proxy/socks mode cannot be combined with protocol suffixes: %q", listenTok)
@@ -129,10 +132,11 @@ func Parse(args []string) (*Config, error) {
 			return nil, err
 		}
 		return &Config{
-			Mode:     mode,
-			Listen:   Endpoint{Addr: addr, TCP: true},
-			LogLevel: opts.logLevel,
-			Verbose:  opts.verbose,
+			Mode:         mode,
+			Listen:       Endpoint{Addr: addr, TCP: true},
+			UpstreamAddr: upstream,
+			LogLevel:     opts.logLevel,
+			Verbose:      opts.verbose,
 		}, nil
 	}
 
@@ -145,11 +149,11 @@ func Parse(args []string) (*Config, error) {
 		return nil, err
 	}
 
-	// TCP/UDP are properties of the relay as a whole: whichever side
-	// declares them wins. Default to TCP-only when neither side says
-	// anything.
-	tcp := target.tcp || listen.tcp
-	udp := target.udp || listen.udp
+	// TCP/UDP are properties of the relay as a whole, and may only be
+	// declared on the listen side (see parseEndpoint). Default to TCP-only
+	// when the listen side says nothing.
+	tcp := listen.tcp
+	udp := listen.udp
 	if !tcp && !udp {
 		tcp = true
 	}
@@ -189,7 +193,11 @@ type options struct {
 	keyPath, certPath, caPath string
 	signCAPath, serverName    string
 	verify                    bool
-	help, version             bool
+	// verifySet reports whether -verify= was given at all (regardless of
+	// its value), so proxy/socks mode -- where verify has no effect -- can
+	// still reject it per SKILL.md, distinct from verify's zero value.
+	verifySet     bool
+	help, version bool
 	// logLevel is the highest of any -d/-dd/-ddd given (0 if none), per
 	// socat's stacking convention; see Config.LogLevel.
 	logLevel int
@@ -255,6 +263,7 @@ func extractOptions(args []string) (options, []string, error) {
 			opts.serverName = strings.TrimPrefix(tok, "-servername=")
 		case strings.HasPrefix(tok, "-verify="):
 			opts.verify = strings.TrimPrefix(tok, "-verify=") != "0"
+			opts.verifySet = true
 		default:
 			return opts, args[i:], nil
 		}
@@ -284,16 +293,66 @@ func matchKeyword(tok, word string) bool {
 	return tok == strings.ToUpper(word) || tok == strings.ToLower(word)
 }
 
+// classifyProxyTarget reports whether targetTok selects proxy/socks mode,
+// in either of two forms:
+//
+//   - the bare keyword ("proxy" / "socks", see proxyMode): dial each
+//     client's requested destination directly, no upstream.
+//   - "<host:port>/proxy" or "<host:port>/socks": chain to the given
+//     upstream proxy/SOCKS server instead of dialing directly. The
+//     upstream is always the same kind as the local listen mode (an
+//     HTTP proxy chains only to an upstream HTTP proxy, SOCKS only to
+//     upstream SOCKS) -- there is no syntax for mixing kinds.
+//
+// ok reports whether targetTok matched either form at all; when it does
+// but the upstream address is invalid, ok is still true and err explains
+// why (the caller should surface it rather than falling through to
+// normal <target> endpoint parsing, which would produce a confusing
+// unrelated error). When ok is false, targetTok is not a proxy/socks
+// target of any kind and the caller should parse it as a normal
+// forwarding endpoint.
+func classifyProxyTarget(targetTok string) (mode Mode, upstream string, ok bool, err error) {
+	if m, matched := proxyMode(targetTok); matched {
+		return m, "", true, nil
+	}
+
+	idx := strings.IndexByte(targetTok, '/')
+	if idx < 0 {
+		return 0, "", false, nil
+	}
+	addrTok, suffix := targetTok[:idx], targetTok[idx+1:]
+	// Only a single "/proxy" or "/socks" suffix triggers chain mode; a
+	// token like "host:port/tcp/proxy" or "host:port/proxy/ssl" falls
+	// through so normal endpoint parsing reports its own (accurate)
+	// error about the unsupported suffix combination.
+	if strings.Contains(suffix, "/") {
+		return 0, "", false, nil
+	}
+	m, matched := proxyMode(suffix)
+	if !matched {
+		return 0, "", false, nil
+	}
+
+	addr, err := normalizeAddr(addrTok, true)
+	if err != nil {
+		return 0, "", true, fmt.Errorf("invalid upstream address %q: %w", addrTok, err)
+	}
+	return m, addr, true, nil
+}
+
 // parsedEndpoint carries the boolean TCP/UDP suffix presence separately
-// from the final Endpoint, since the final TCP/UDP flags are only decided
-// once both target and listen tokens have been parsed.
+// from the final Endpoint. Only the listen token may carry /TCP or /UDP
+// (see parseEndpoint); the final TCP/UDP flags mirror the listen side and
+// are applied to both target.ep and listen.ep once parsing is done.
 type parsedEndpoint struct {
 	ep       Endpoint
 	tcp, udp bool
 }
 
 // parseEndpoint splits tok into its address and "/TCP" "/UDP" "/SSL"
-// suffixes, and validates each part.
+// suffixes, and validates each part. /TCP and /UDP are only valid on the
+// listen token (isTarget == false); a target token carrying either is an
+// error. /SSL is valid on both.
 func parseEndpoint(tok string, isTarget bool) (parsedEndpoint, error) {
 	addrTok := tok
 	var suffixToks []string
@@ -321,6 +380,9 @@ func parseEndpoint(tok string, isTarget bool) (parsedEndpoint, error) {
 		idx, ok := keywordOrder[upper]
 		if !ok {
 			return parsedEndpoint{}, fmt.Errorf("unknown protocol suffix %q in %q (expected TCP, UDP, or SSL)", s, tok)
+		}
+		if isTarget && (upper == "TCP" || upper == "UDP") {
+			return parsedEndpoint{}, fmt.Errorf("protocol suffix %q not allowed on <target> (%q); specify /TCP and/or /UDP on <listen> instead", s, tok)
 		}
 		if seen[upper] {
 			return parsedEndpoint{}, fmt.Errorf("protocol suffix %q repeated in %q", s, tok)

@@ -90,7 +90,7 @@ gopr 192.0.2.11:5555 6666
 
 ### プロトコルサフィックス(`/tcp`, `/udp`, `/ssl`)
 
-`target` または `listen` の末尾に `/tcp`・`/udp`・`/ssl` を、この順序で付与する。何も指定しない場合のデフォルトはTCPのみ。`/ssl` は必ず暗号化を話す側に付与する(終端なら `listen`、開始なら `target`)。`/ssl` はそのリレーで有効なTCP/UDPそれぞれに作用する — TCP側はTLS、UDP側は[pion/dtls](https://github.com/pion/dtls)によるDTLSで、どちらも同じ `-cert=`/`-key=`/`-ca=` を共有する。`-signca=`(MITM)はTCP専用で、`listen`側で`/udp/ssl`が有効な場合に併用するとエラーになる。
+`listen` の末尾に `/tcp`・`/udp`・`/ssl` を、この順序で付与する。`/tcp`・`/udp` は `listen` 側のみで有効 — gopr が対応するのはTCP→TCP、UDP→UDPの転送のみでプロトコル変換は行わないため、`target` 側に `/tcp` や `/udp` を付与するとエラーになる。何も指定しない場合のデフォルトはTCPのみ。`/ssl` は必ず暗号化を話す側に付与する(終端なら `listen`、開始なら `target`)。`/ssl` は `/tcp`・`/udp` の指定場所に関わらず `target`・`listen` どちらにも付与でき、そのリレーで有効なTCP/UDPそれぞれに作用する — TCP側はTLS、UDP側は[pion/dtls](https://github.com/pion/dtls)によるDTLSで、どちらも同じ `-cert=`/`-key=`/`-ca=` を共有する。`-signca=`(MITM)はTCP専用で、`listen`側で`/udp/ssl`が有効な場合に併用するとエラーになる。
 
 サフィックスのキーワードは全て大文字、または全て小文字(1トークン内での混在は不可)。コマンド内のトークン間での大文字/小文字の統一は不要。
 
@@ -115,10 +115,10 @@ gopr -signca=/server/ca.pem 192.0.2.11:7777 8888/ssl
 gopr 192.0.2.11:7777 8888
 
 # UDPのみ
-gopr 192.0.2.11:7777/udp 8888
+gopr 192.0.2.11:7777 8888/udp
 
 # TCP・UDP両方
-gopr 192.0.2.11:7777/tcp/udp 8888
+gopr 192.0.2.11:7777 8888/tcp/udp
 
 # DTLS終端: 8888/udpで受けたDTLSを復号し、平文で転送先へ
 gopr -key=/server/cert.key -cert=/server/cert.pem 192.0.2.11:7777 8888/udp/ssl
@@ -161,6 +161,12 @@ gopr proxy 8888
 # SOCKS5プロキシとして8888番で待受
 gopr socks 8888
 
+# HTTPプロキシとして8888番で待受け、上位のHTTPプロキシ(192.0.2.11:7777)へ転送
+gopr 192.0.2.11:7777/proxy 8888
+
+# SOCKS5プロキシとして8888番で待受け、上位のSOCKSプロキシ(192.0.2.11:7777)へ転送
+gopr 192.0.2.11:7777/socks 8888
+
 # 1プロセスで2つの転送を同時に実行(上記「複数ターゲットの指定」参照)
 gopr 192.0.2.11:7777 8888 -- 192.0.2.11:5555 6666
 
@@ -187,6 +193,23 @@ gopr -version
 
 `target` の値が、ポートを伴わない単独のリテラル `proxy` または `socks`(大文字・小文字は統一されていれば可、例: `PROXY`)と完全一致する場合、`listen` はそれぞれHTTPプロキシ・SOCKS5プロキシの待受アドレスとして扱われ、通常の転送処理は行われない。
 これらのモードは `-key=`/`-cert=`/`-ca=`/`-verify=`/`-signca=`/`-servername=` や `/tcp`・`/udp`・`/ssl` サフィックスとは併用できない(`-d`/`-dd`/`-ddd`/`-v` は併用可)。
+
+### 上位プロキシへのチェーン(`<host:port>/proxy`, `<host:port>/socks`)
+
+`target` を `<host:port>/proxy` または `<host:port>/socks` の形で指定すると、`listen` で受けた接続を直接宛先へダイヤルせず、指定した上位プロキシ/上位SOCKSサーバー経由で中継する。上位の種別は待受モードと常に同じになる(`/proxy` は上位もHTTPプロキシ、`/socks` は上位もSOCKSサーバー)— HTTPプロキシで待受けつつ上位をSOCKSにする、といった異種の組み合わせはサポートしない。
+
+```bash
+# HTTPプロキシとして8888番で待受け、上位のHTTPプロキシ(192.0.2.11:7777)へ転送
+gopr 192.0.2.11:7777/proxy 8888
+
+# SOCKS5プロキシとして8888番で待受け、上位のSOCKSプロキシ(192.0.2.11:7777)へ転送
+gopr 192.0.2.11:7777/socks 8888
+```
+
+- `<host:port>` は通常の`target`と同様に必ずポートを含む(IPv4/IPv6/ホスト名いずれも可)。
+- 単独の`proxy`/`socks`キーワード(上位なし・直接ダイヤル)と同じ制約が適用される: `-key=`/`-cert=`/`-ca=`/`-verify=`/`-signca=`/`-servername=` や `/tcp`・`/udp`・`/ssl` との併用は不可、`-d`/`-dd`/`-ddd`/`-v`は併用可。
+- 上位プロキシ/上位SOCKSサーバーへの認証(Basic認証・SOCKS5ユーザー名パスワード認証)およびTLS接続(HTTPSプロキシ経由)は現時点では未対応。上位サーバーは認証なし・平文接続を前提とする。
+- SOCKSは現行実装と同様CONNECTのみ対応(BIND・UDP ASSOCIATE非対応)。上位への転送でもこの制約は変わらない。
 
 ## 制限事項
 

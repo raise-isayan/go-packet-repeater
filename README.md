@@ -113,13 +113,16 @@ all IPv6 interfaces (and, on most platforms, dual-stack IPv4 too), use
 ### Protocol suffixes (`/tcp`, `/udp`, `/ssl`)
 
 Append `/tcp`, `/udp`, and/or `/ssl` to `target` or `listen`, always in that
-order. Default protocol is TCP-only when nothing is specified. `/ssl` always
-goes on whichever side speaks encrypted traffic: `listen` for termination,
-`target` for origination. `/ssl` secures whichever of TCP/UDP are active for
-that relay — TLS over TCP, DTLS (via [pion/dtls](https://github.com/pion/dtls))
-over UDP — sharing the same `-cert=`/`-key=`/`-ca=` options. `-signca=`
-(MITM) is TCP-only; combining it with an active `/udp/ssl` on the listen
-side is an error.
+order. `/tcp` and `/udp` are only valid on `listen` — gopr only relays
+TCP→TCP and UDP→UDP, never converts between them, so `target` carrying a
+`/tcp` or `/udp` suffix is an error. Default protocol is TCP-only when
+nothing is specified. `/ssl` always goes on whichever side speaks encrypted
+traffic: `listen` for termination, `target` for origination, and it may
+appear on either side regardless of where `/tcp`/`/udp` was declared. `/ssl`
+secures whichever of TCP/UDP are active for that relay — TLS over TCP, DTLS
+(via [pion/dtls](https://github.com/pion/dtls)) over UDP — sharing the same
+`-cert=`/`-key=`/`-ca=` options. `-signca=` (MITM) is TCP-only; combining it
+with an active `/udp/ssl` on the listen side is an error.
 
 Suffix keywords may be all-uppercase or all-lowercase (not mixed within one
 token), and case may differ between tokens in the same command.
@@ -153,10 +156,10 @@ gopr -signca=/server/ca.pem 192.0.2.11:7777 8888/ssl
 gopr 192.0.2.11:7777 8888
 
 # Same, but UDP only
-gopr 192.0.2.11:7777/udp 8888
+gopr 192.0.2.11:7777 8888/udp
 
 # TCP and UDP together
-gopr 192.0.2.11:7777/tcp/udp 8888
+gopr 192.0.2.11:7777 8888/tcp/udp
 
 # DTLS termination: decrypt incoming DTLS on 8888/udp, forward plaintext to target
 gopr -key=/server/cert.key -cert=/server/cert.pem 192.0.2.11:7777 8888/udp/ssl
@@ -199,6 +202,12 @@ gopr proxy 8888
 # SOCKS5 proxy on 8888
 gopr socks 8888
 
+# HTTP proxy on 8888, chained to an upstream HTTP proxy (192.0.2.11:7777)
+gopr 192.0.2.11:7777/proxy 8888
+
+# SOCKS5 proxy on 8888, chained to an upstream SOCKS proxy (192.0.2.11:7777)
+gopr 192.0.2.11:7777/socks 8888
+
 # Two relays from one process (see "Multiple targets" above)
 gopr 192.0.2.11:7777 8888 -- 192.0.2.11:5555 6666
 
@@ -229,6 +238,34 @@ HTTP proxy or SOCKS5 proxy, respectively, and normal forwarding is bypassed
 entirely. These modes cannot be combined with `-key=`/`-cert=`/`-ca=`/
 `-verify=`/`-signca=`/`-servername=` or any `/tcp`, `/udp`, `/ssl` suffix
 (`-d`/`-dd`/`-ddd`/`-v` remain usable).
+
+### Chaining to an upstream proxy (`<host:port>/proxy`, `<host:port>/socks`)
+
+Giving `target` as `<host:port>/proxy` or `<host:port>/socks` instead of the
+bare keyword chains the proxy to an upstream server of the same kind
+instead of dialing each client's requested destination directly: `/proxy`
+relays through an upstream HTTP proxy, `/socks` through an upstream SOCKS5
+server. The upstream is always the same kind as the local listen mode —
+there's no syntax for mixing (e.g. an HTTP proxy chaining to an upstream
+SOCKS server).
+
+```bash
+# HTTP proxy on 8888, chained to an upstream HTTP proxy
+gopr 192.0.2.11:7777/proxy 8888
+
+# SOCKS5 proxy on 8888, chained to an upstream SOCKS proxy
+gopr 192.0.2.11:7777/socks 8888
+```
+
+- `<host:port>` requires a port, same as a normal `target`.
+- The same restrictions as the bare keyword form apply: no `-key=`/`-cert=`/
+  `-ca=`/`-verify=`/`-signca=`/`-servername=` or `/tcp`/`/udp`/`/ssl`
+  suffixes (`-d`/`-dd`/`-ddd`/`-v` remain usable).
+- Authentication (HTTP Basic, SOCKS5 username/password) and TLS to the
+  upstream (i.e. an HTTPS proxy) are not supported yet; the upstream is
+  assumed to be unauthenticated and unencrypted.
+- SOCKS chaining still only supports CONNECT, matching the existing SOCKS
+  server implementation (no BIND, no UDP ASSOCIATE).
 
 ## Limitations
 

@@ -3,10 +3,12 @@
 package proxy
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 
@@ -19,18 +21,30 @@ import (
 // "proxy" mode is HTTP-only: it never performs TLS termination itself.
 // cfg.LogLevel/cfg.Verbose select diagnostic detail and data dumping (-d/-v),
 // same as forwarding mode.
+//
+// When cfg.UpstreamAddr is set (<target> was "<host:port>/proxy"), every
+// request is relayed through that upstream HTTP proxy instead of being
+// dialed directly: a CONNECT is issued to the upstream for tunneled
+// requests, and plain requests are sent via an http.Transport configured
+// with the upstream as its Proxy.
 func RunHTTP(ctx context.Context, cfg *config.Config) error {
 	log := logx.New(logx.Level(cfg.LogLevel), cfg.Verbose)
 	addr := cfg.Listen.Addr
+	upstream := cfg.UpstreamAddr
+
+	transport := http.DefaultTransport
+	if upstream != "" {
+		transport = &http.Transport{Proxy: http.ProxyURL(&url.URL{Scheme: "http", Host: upstream})}
+	}
 
 	srv := &http.Server{
 		Addr: addr,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method == http.MethodConnect {
-				handleConnect(w, r, log)
+				handleConnect(w, r, log, upstream)
 				return
 			}
-			handleForward(w, r, log)
+			handleForward(w, r, log, transport)
 		}),
 	}
 
@@ -41,7 +55,11 @@ func RunHTTP(ctx context.Context, cfg *config.Config) error {
 		srv.Shutdown(shutdownCtx)
 	}()
 
-	log.Print("http proxy: listening on %s", addr)
+	if upstream != "" {
+		log.Print("http proxy: listening on %s, forwarding via upstream proxy %s", addr, upstream)
+	} else {
+		log.Print("http proxy: listening on %s", addr)
+	}
 	err := srv.ListenAndServe()
 	if err == http.ErrServerClosed {
 		return nil
@@ -50,13 +68,21 @@ func RunHTTP(ctx context.Context, cfg *config.Config) error {
 }
 
 // handleConnect tunnels an HTTPS (or other TCP) connection through a
-// CONNECT request without decrypting it.
-func handleConnect(w http.ResponseWriter, r *http.Request, log *logx.Logger) {
+// CONNECT request without decrypting it. When upstream is non-empty, the
+// tunnel is established via an upstream HTTP proxy (see dialUpstreamConnect)
+// instead of dialing r.Host directly.
+func handleConnect(w http.ResponseWriter, r *http.Request, log *logx.Logger, upstream string) {
 	label := fmt.Sprintf("http-connect %s", r.Host)
 	log.Warn("%s: request from %s", label, r.RemoteAddr)
 	start := time.Now()
 
-	dst, err := net.DialTimeout("tcp", r.Host, 10*time.Second)
+	var dst net.Conn
+	var err error
+	if upstream != "" {
+		dst, err = dialUpstreamConnect(upstream, r.Host)
+	} else {
+		dst, err = net.DialTimeout("tcp", r.Host, 10*time.Second)
+	}
 	if err != nil {
 		log.Error("http-connect: %s: dial: %v", r.Host, err)
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -106,8 +132,10 @@ var hopByHopHeaders = []string{
 }
 
 // handleForward proxies a plain (non-CONNECT) HTTP request to its
-// destination and copies the response back.
-func handleForward(w http.ResponseWriter, r *http.Request, log *logx.Logger) {
+// destination and copies the response back, using transport (either
+// http.DefaultTransport for direct dialing, or an http.Transport pointed
+// at an upstream proxy -- see RunHTTP).
+func handleForward(w http.ResponseWriter, r *http.Request, log *logx.Logger, transport http.RoundTripper) {
 	if !r.URL.IsAbs() {
 		http.Error(w, "proxy: request URI must be absolute", http.StatusBadRequest)
 		return
@@ -122,7 +150,7 @@ func handleForward(w http.ResponseWriter, r *http.Request, log *logx.Logger) {
 		outReq.Header.Del(h)
 	}
 
-	resp, err := http.DefaultTransport.RoundTrip(outReq)
+	resp, err := transport.RoundTrip(outReq)
 	if err != nil {
 		log.Error("http: %s: %v", label, err)
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -142,3 +170,55 @@ func handleForward(w http.ResponseWriter, r *http.Request, log *logx.Logger) {
 	w.WriteHeader(resp.StatusCode)
 	logx.Copy(log, label, false, w, resp.Body)
 }
+
+// dialUpstreamConnect dials upstream (an HTTP proxy address) and issues an
+// HTTP CONNECT request for targetHost, returning the tunneled connection
+// once the upstream reports success. Used by handleConnect when gopr's own
+// HTTP proxy is chained to an upstream one (cfg.UpstreamAddr).
+func dialUpstreamConnect(upstream, targetHost string) (net.Conn, error) {
+	conn, err := net.DialTimeout("tcp", upstream, 10*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("dial upstream proxy %s: %w", upstream, err)
+	}
+
+	req := &http.Request{
+		Method: http.MethodConnect,
+		URL:    &url.URL{Opaque: targetHost},
+		Host:   targetHost,
+		Header: make(http.Header),
+	}
+	if err := req.Write(conn); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("upstream proxy %s: write CONNECT: %w", upstream, err)
+	}
+
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, req)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("upstream proxy %s: read CONNECT response: %w", upstream, err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		conn.Close()
+		return nil, fmt.Errorf("upstream proxy %s: CONNECT %s: %s", upstream, targetHost, resp.Status)
+	}
+
+	if br.Buffered() > 0 {
+		// The bufio.Reader used to parse the CONNECT response may have
+		// read ahead into the start of the tunneled stream; preserve
+		// those bytes instead of dropping them.
+		return &bufferedConn{Conn: conn, r: br}, nil
+	}
+	return conn, nil
+}
+
+// bufferedConn wraps a net.Conn whose initial bytes have already been
+// consumed into a bufio.Reader, transparently serving those buffered bytes
+// first on Read.
+type bufferedConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func (b *bufferedConn) Read(p []byte) (int, error) { return b.r.Read(p) }

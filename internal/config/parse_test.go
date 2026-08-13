@@ -71,19 +71,19 @@ func TestParseForwardExamples(t *testing.T) {
 		},
 		{
 			name:       "explicit TCP",
-			args:       []string{"192.168.0.2:7777/TCP", "8888"},
+			args:       []string{"192.168.0.2:7777", "8888/TCP"},
 			wantTarget: Endpoint{Addr: "192.168.0.2:7777", TCP: true},
 			wantListen: Endpoint{Addr: "0.0.0.0:8888", TCP: true},
 		},
 		{
 			name:       "UDP only",
-			args:       []string{"192.168.0.2:7777/UDP", "8888"},
+			args:       []string{"192.168.0.2:7777", "8888/UDP"},
 			wantTarget: Endpoint{Addr: "192.168.0.2:7777", UDP: true},
 			wantListen: Endpoint{Addr: "0.0.0.0:8888", UDP: true},
 		},
 		{
 			name:       "TCP+UDP",
-			args:       []string{"192.168.0.2:7777/TCP/UDP", "8888"},
+			args:       []string{"192.168.0.2:7777", "8888/TCP/UDP"},
 			wantTarget: Endpoint{Addr: "192.168.0.2:7777", TCP: true, UDP: true},
 			wantListen: Endpoint{Addr: "0.0.0.0:8888", TCP: true, UDP: true},
 		},
@@ -148,14 +148,14 @@ func TestParseTLS(t *testing.T) {
 		}
 	})
 
-	t.Run("UDP-only DTLS termination requires -cert=", func(t *testing.T) {
-		if _, err := Parse([]string{"192.168.0.2:7777/UDP/SSL", "8888"}); err == nil {
-			t.Fatal("expected error: DTLS termination on UDP requires -cert=")
+	t.Run("UDP-only DTLS origination requires -cert=", func(t *testing.T) {
+		if _, err := Parse([]string{"192.168.0.2:7777/SSL", "8888/UDP"}); err == nil {
+			t.Fatal("expected error: DTLS origination toward target requires -cert=")
 		}
 	})
 
-	t.Run("UDP-only DTLS termination with -cert= is valid", func(t *testing.T) {
-		cfg, err := Parse([]string{"-key=" + keyOnly, "-cert=" + certNoKey, "192.168.0.2:7777/UDP/SSL", "8888"})
+	t.Run("UDP-only DTLS origination with -cert= is valid", func(t *testing.T) {
+		cfg, err := Parse([]string{"-key=" + keyOnly, "-cert=" + certNoKey, "192.168.0.2:7777/SSL", "8888/UDP"})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -196,20 +196,20 @@ func TestParseTLS(t *testing.T) {
 	})
 
 	t.Run("lowercase and mixed-case-between-tokens suffixes", func(t *testing.T) {
-		cfg, err := Parse([]string{"-key=" + keyOnly, "-cert=" + certNoKey, "192.168.0.2:7777/tcp/udp/ssl", "8888"})
+		cfg, err := Parse([]string{"-key=" + keyOnly, "-cert=" + certNoKey, "192.168.0.2:7777", "8888/tcp/udp/ssl"})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if !cfg.Target.TCP || !cfg.Target.UDP || !cfg.Target.SSL {
-			t.Errorf("Target = %+v, want TCP+UDP+SSL", cfg.Target)
+		if !cfg.Listen.TCP || !cfg.Listen.UDP || !cfg.Listen.SSL {
+			t.Errorf("Listen = %+v, want TCP+UDP+SSL", cfg.Listen)
 		}
 
-		cfg2, err := Parse([]string{"-key=" + keyOnly, "-cert=" + certNoKey, "192.168.0.2:7777/TCP/ssl", "8888"})
+		cfg2, err := Parse([]string{"-key=" + keyOnly, "-cert=" + certNoKey, "192.168.0.2:7777", "8888/TCP/ssl"})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if !cfg2.Target.TCP || !cfg2.Target.SSL || cfg2.Target.UDP {
-			t.Errorf("Target = %+v, want TCP+SSL only", cfg2.Target)
+		if !cfg2.Listen.TCP || !cfg2.Listen.SSL || cfg2.Listen.UDP {
+			t.Errorf("Listen = %+v, want TCP+SSL only", cfg2.Listen)
 		}
 	})
 }
@@ -273,6 +273,18 @@ func TestParseProxyModes(t *testing.T) {
 		}
 	})
 
+	t.Run("proxy with -verify= is an error", func(t *testing.T) {
+		if _, err := Parse([]string{"-verify=0", "proxy", "8888"}); err == nil {
+			t.Fatal("expected error combining proxy mode with -verify=")
+		}
+	})
+
+	t.Run("upstream chain with -verify= is an error", func(t *testing.T) {
+		if _, err := Parse([]string{"-verify=0", "192.0.2.11:7777/proxy", "8888"}); err == nil {
+			t.Fatal("expected error combining upstream proxy chain with -verify=")
+		}
+	})
+
 	t.Run("proxy with protocol suffix is an error", func(t *testing.T) {
 		if _, err := Parse([]string{"proxy/TCP", "8888"}); err == nil {
 			t.Fatal("expected error: 'proxy/TCP' is not proxy mode and has no port")
@@ -282,6 +294,88 @@ func TestParseProxyModes(t *testing.T) {
 	t.Run("proxy with suffix on listen is an error", func(t *testing.T) {
 		if _, err := Parse([]string{"proxy", "8888/TCP"}); err == nil {
 			t.Fatal("expected error combining proxy mode with listen suffix")
+		}
+	})
+
+	t.Run("HTTP proxy chained to upstream", func(t *testing.T) {
+		cfg, err := Parse([]string{"192.0.2.11:7777/proxy", "8888"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.Mode != ModeHTTPProxy {
+			t.Errorf("Mode = %v, want ModeHTTPProxy", cfg.Mode)
+		}
+		if cfg.UpstreamAddr != "192.0.2.11:7777" {
+			t.Errorf("UpstreamAddr = %q, want 192.0.2.11:7777", cfg.UpstreamAddr)
+		}
+		if cfg.Listen.Addr != "0.0.0.0:8888" {
+			t.Errorf("Listen.Addr = %q, want 0.0.0.0:8888", cfg.Listen.Addr)
+		}
+	})
+
+	t.Run("SOCKS proxy chained to upstream", func(t *testing.T) {
+		cfg, err := Parse([]string{"192.0.2.11:7777/socks", "8888"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.Mode != ModeSOCKSProxy {
+			t.Errorf("Mode = %v, want ModeSOCKSProxy", cfg.Mode)
+		}
+		if cfg.UpstreamAddr != "192.0.2.11:7777" {
+			t.Errorf("UpstreamAddr = %q, want 192.0.2.11:7777", cfg.UpstreamAddr)
+		}
+	})
+
+	t.Run("bare proxy keyword leaves UpstreamAddr empty", func(t *testing.T) {
+		cfg, err := Parse([]string{"proxy", "8888"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.UpstreamAddr != "" {
+			t.Errorf("UpstreamAddr = %q, want empty", cfg.UpstreamAddr)
+		}
+	})
+
+	t.Run("upstream chain uppercase suffix", func(t *testing.T) {
+		cfg, err := Parse([]string{"192.0.2.11:7777/PROXY", "8888"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.Mode != ModeHTTPProxy || cfg.UpstreamAddr != "192.0.2.11:7777" {
+			t.Errorf("Mode/UpstreamAddr = %v/%q, want ModeHTTPProxy/192.0.2.11:7777", cfg.Mode, cfg.UpstreamAddr)
+		}
+	})
+
+	t.Run("upstream chain hostname without port is an error", func(t *testing.T) {
+		if _, err := Parse([]string{"example.com/proxy", "8888"}); err == nil {
+			t.Fatal("expected error: upstream address missing a port")
+		}
+	})
+
+	t.Run("upstream chain with -cert= is an error", func(t *testing.T) {
+		if _, err := Parse([]string{"-cert=/x.pem", "192.0.2.11:7777/proxy", "8888"}); err == nil {
+			t.Fatal("expected error combining upstream proxy chain with -cert=")
+		}
+	})
+
+	t.Run("upstream chain with mixed-case suffix is not proxy mode", func(t *testing.T) {
+		// "Proxy" (mixed case) doesn't match the keyword policy, so this
+		// falls through to normal <target> endpoint parsing, where /Proxy
+		// is an unknown protocol suffix.
+		if _, err := Parse([]string{"192.0.2.11:7777/Proxy", "8888"}); err == nil {
+			t.Fatal("expected error: mixed-case 'Proxy' suffix is not recognized")
+		}
+	})
+
+	t.Run("upstream chain combined with another suffix is an error", func(t *testing.T) {
+		if _, err := Parse([]string{"192.0.2.11:7777/tcp/proxy", "8888"}); err == nil {
+			t.Fatal("expected error: /proxy cannot combine with /tcp on target")
+		}
+	})
+
+	t.Run("upstream chain on listen side is not supported", func(t *testing.T) {
+		if _, err := Parse([]string{"192.0.2.11:7777", "8888/proxy"}); err == nil {
+			t.Fatal("expected error: /proxy suffix only recognized on <target>")
 		}
 	})
 }
@@ -304,8 +398,11 @@ func TestParseErrors(t *testing.T) {
 		{"SSL without cert", []string{"192.168.0.2:7777", "8888/SSL"}},
 		{"mixed case suffix", []string{"192.168.0.2:7777/Tcp", "8888"}},
 		{"unknown suffix", []string{"192.168.0.2:7777/FOO", "8888"}},
-		{"wrong suffix order", []string{"192.168.0.2:7777/UDP/TCP", "8888"}},
-		{"duplicate suffix", []string{"192.168.0.2:7777/TCP/TCP", "8888"}},
+		{"wrong suffix order", []string{"192.168.0.2:7777", "8888/UDP/TCP"}},
+		{"duplicate suffix", []string{"192.168.0.2:7777", "8888/TCP/TCP"}},
+		{"TCP suffix on target is an error", []string{"192.168.0.2:7777/TCP", "8888"}},
+		{"UDP suffix on target is an error", []string{"192.168.0.2:7777/UDP", "8888"}},
+		{"TCP/UDP suffix on target is an error", []string{"192.168.0.2:7777/TCP/UDP", "8888"}},
 		{"port out of range", []string{"192.168.0.2:70000", "8888"}},
 		{"port zero", []string{"192.168.0.2:0", "8888"}},
 		{"invalid port", []string{"192.168.0.2:abc", "8888"}},
@@ -653,7 +750,7 @@ func TestParseSignCA(t *testing.T) {
 	})
 
 	t.Run("-signca= with listen-side UDP+SSL (DTLS) is an error", func(t *testing.T) {
-		if _, err := Parse([]string{"-signca=/ca.pem", "192.0.2.11:7777/UDP", "8888/TCP/UDP/SSL"}); err == nil {
+		if _, err := Parse([]string{"-signca=/ca.pem", "192.0.2.11:7777", "8888/TCP/UDP/SSL"}); err == nil {
 			t.Fatal("expected error: -signca= does not support DTLS termination over UDP")
 		}
 	})
