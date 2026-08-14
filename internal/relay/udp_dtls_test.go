@@ -180,10 +180,9 @@ func TestServeUDPDTLSDecodeOnly(t *testing.T) {
 
 	listenAddr := fmt.Sprintf("127.0.0.1:%d", freeUDPPort(t))
 	cfg := &config.Config{
-		Listen:   config.Endpoint{Addr: listenAddr, UDP: true, SSL: true},
-		Target:   config.Endpoint{Addr: targetAddr, UDP: true},
-		CertPath: certPath,
-		Verify:   true,
+		Listen:    config.Endpoint{Addr: listenAddr, UDP: true, SSL: true},
+		Target:    config.Endpoint{Addr: targetAddr, UDP: true},
+		ServerTLS: config.ServerTLSConfig{CertPath: certPath, VerifyClient: true},
 	}
 	go serveUDPDTLS(ctx, cfg, logx.New(logx.LevelDebug, false))
 
@@ -217,10 +216,10 @@ func TestServeUDPDTLSBothSides(t *testing.T) {
 
 	listenAddr := fmt.Sprintf("127.0.0.1:%d", freeUDPPort(t))
 	cfg := &config.Config{
-		Listen:   config.Endpoint{Addr: listenAddr, UDP: true, SSL: true},
-		Target:   config.Endpoint{Addr: targetAddr, UDP: true, SSL: true},
-		CertPath: certPath,
-		Verify:   false,
+		Listen:    config.Endpoint{Addr: listenAddr, UDP: true, SSL: true},
+		Target:    config.Endpoint{Addr: targetAddr, UDP: true, SSL: true},
+		ServerTLS: config.ServerTLSConfig{CertPath: certPath, VerifyClient: true},
+		ClientTLS: config.ClientTLSConfig{Verify: false},
 	}
 	go serveUDPDTLS(ctx, cfg, logx.New(logx.LevelDebug, false))
 

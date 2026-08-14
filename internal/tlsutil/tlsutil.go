@@ -68,9 +68,10 @@ func loadCAPool(caPath string) (*x509.CertPool, error) {
 }
 
 // ServerConfig builds the tls.Config used to terminate TLS on the listen
-// side (decode: TLS -> plaintext). When caPath is set, client certificates
-// are required and verified against it (mTLS).
-func ServerConfig(certPath, keyPath, caPath string) (*tls.Config, error) {
+// side (decode: TLS -> plaintext). When caPath is set, a client certificate
+// is required (mTLS); verifyClient then controls whether it is also
+// verified against caPath (false only when -verify=0 was given under -Z).
+func ServerConfig(certPath, keyPath, caPath string, verifyClient bool) (*tls.Config, error) {
 	cert, err := loadCertificate(certPath, keyPath)
 	if err != nil {
 		return nil, err
@@ -82,7 +83,11 @@ func ServerConfig(certPath, keyPath, caPath string) (*tls.Config, error) {
 			return nil, err
 		}
 		cfg.ClientCAs = pool
-		cfg.ClientAuth = tls.RequireAndVerifyClientCert
+		if verifyClient {
+			cfg.ClientAuth = tls.RequireAndVerifyClientCert
+		} else {
+			cfg.ClientAuth = tls.RequireAnyClientCert
+		}
 	}
 	return cfg, nil
 }
@@ -186,8 +191,9 @@ func (m *MITMSigner) CertificateFor(hostname string) (*tls.Certificate, error) {
 // (MITM mode, -signca=). explicitServerName (-servername=), if non-empty,
 // overrides the hostname for every connection; otherwise each
 // connection's own SNI is used, and a connection that presents none is
-// rejected. caPath behaves exactly as in ServerConfig (optional mTLS).
-func MITMServerConfig(signer *MITMSigner, explicitServerName, caPath string) (*tls.Config, error) {
+// rejected. caPath and verifyClient behave exactly as in ServerConfig
+// (optional mTLS).
+func MITMServerConfig(signer *MITMSigner, explicitServerName, caPath string, verifyClient bool) (*tls.Config, error) {
 	cfg := &tls.Config{
 		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 			hostname := explicitServerName
@@ -206,7 +212,11 @@ func MITMServerConfig(signer *MITMSigner, explicitServerName, caPath string) (*t
 			return nil, err
 		}
 		cfg.ClientCAs = pool
-		cfg.ClientAuth = tls.RequireAndVerifyClientCert
+		if verifyClient {
+			cfg.ClientAuth = tls.RequireAndVerifyClientCert
+		} else {
+			cfg.ClientAuth = tls.RequireAnyClientCert
+		}
 	}
 	return cfg, nil
 }

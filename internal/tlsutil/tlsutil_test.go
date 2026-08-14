@@ -186,7 +186,7 @@ func TestMITMServerConfigGetCertificate(t *testing.T) {
 	}
 
 	t.Run("uses the client's SNI when no explicit server name is given", func(t *testing.T) {
-		cfg, err := MITMServerConfig(signer, "", "")
+		cfg, err := MITMServerConfig(signer, "", "", true)
 		if err != nil {
 			t.Fatalf("MITMServerConfig: %v", err)
 		}
@@ -201,7 +201,7 @@ func TestMITMServerConfigGetCertificate(t *testing.T) {
 	})
 
 	t.Run("explicit server name overrides SNI", func(t *testing.T) {
-		cfg, err := MITMServerConfig(signer, "forced.example.com", "")
+		cfg, err := MITMServerConfig(signer, "forced.example.com", "", true)
 		if err != nil {
 			t.Fatalf("MITMServerConfig: %v", err)
 		}
@@ -216,7 +216,7 @@ func TestMITMServerConfigGetCertificate(t *testing.T) {
 	})
 
 	t.Run("no explicit server name and no SNI is an error", func(t *testing.T) {
-		cfg, err := MITMServerConfig(signer, "", "")
+		cfg, err := MITMServerConfig(signer, "", "", true)
 		if err != nil {
 			t.Fatalf("MITMServerConfig: %v", err)
 		}

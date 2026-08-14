@@ -23,15 +23,16 @@ var keywordOrder = map[string]int{
 const Usage = `gopr [option] <target> <listen>
 
 [option]
-  [-key=<path>]           ; key file
-  [-cert=<path>]          ; cert file
-  [-ca=<path>]            ; ca file
-  [-verify=<value>]       ; verify=0 Do not verify the TLS certificate.
-  [-signca=<path>]        ; CA (cert + private key) used to mint a leaf
-                          ; certificate per connection for TLS termination
-                          ; (MITM). Mutually exclusive with -cert=/-key=.
-  [-servername=<value>]   ; hostname for the generated certificate;
-                          ; overrides the client's SNI. Requires -signca=.
+  [-Q <SSL>]              ; SSL client option: TLS/DTLS origination toward
+                          ; <target>. Requires <target>/SSL.
+  [-Z <SSL>]              ; SSL server option: static TLS/DTLS termination
+                          ; on <listen>. Requires <listen>/SSL. Mutually
+                          ; exclusive with -M.
+  [-M <MITM>]             ; SSL server MITM option: per-connection generated
+                          ; certificate for TLS termination on <listen>,
+                          ; instead of -Z's static certificate. Requires
+                          ; <listen>/SSL; TCP only. Mutually exclusive
+                          ; with -Z.
   [-d | -dd | -ddd]       ; debug output; each additional d prints one more,
                           ; less severe tier of diagnostics (socat-style):
                           ; -d = connection/session lifecycle, -dd = adds
@@ -42,7 +43,27 @@ const Usage = `gopr [option] <target> <listen>
                           ; to stderr. Independent of -d. May reveal
                           ; sensitive content -- use with care.
   [-help]                 ; show help
-  [-version]              ; show version`
+  [-version]              ; show version
+
+<SSL>                     ; sub-options of -Q / -Z, in either order
+  [-key=<path>]           ; this side's own key file
+  [-cert=<path>]          ; this side's own cert file (optional under -Q;
+                          ; required under -Z unless -M is used instead)
+  [-ca=<path>]            ; CA verifying the peer's certificate (under -Q:
+                          ; the target's cert; under -Z: requests and
+                          ; verifies a client cert, i.e. mTLS)
+  [-verify=<value>]       ; verify=0: under -Q, don't verify the target's
+                          ; certificate; under -Z, still require a client
+                          ; certificate (when -ca= is set) but don't verify
+                          ; it against -ca=
+
+<MITM>                    ; sub-options of -M, in any order
+  [-signca=<path>]        ; CA (cert + private key) used to mint a leaf
+                          ; certificate per connection for TLS termination
+  [-servername=<value>]   ; hostname for the generated certificate;
+                          ; overrides the client's SNI
+  [-ca=<path>]            ; same as -Z's -ca= (mTLS)
+  [-verify=<value>]       ; same as -Z's -verify=`
 
 // ParseAll builds one Config per "--"-separated group of arguments in args.
 // "gopr A -- B" behaves like running "gopr A" and "gopr B" concurrently as
@@ -121,8 +142,8 @@ func Parse(args []string) (*Config, error) {
 		if perr != nil {
 			return nil, perr
 		}
-		if opts.keyPath != "" || opts.certPath != "" || opts.caPath != "" || opts.verifySet || opts.signCAPath != "" || opts.serverName != "" {
-			return nil, errors.New("proxy/socks mode cannot be combined with -key=/-cert=/-ca=/-verify=/-signca=/-servername=")
+		if opts.q.seen || opts.z.seen || opts.m.seen {
+			return nil, errors.New("proxy/socks mode cannot be combined with -Q/-Z/-M")
 		}
 		if strings.Contains(listenTok, "/") {
 			return nil, fmt.Errorf("proxy/socks mode cannot be combined with protocol suffixes: %q", listenTok)
@@ -168,35 +189,63 @@ func Parse(args []string) (*Config, error) {
 	sslTargetUDP := udp && target.ep.SSL
 	sslListen := sslListenTCP || sslListenUDP
 	sslTarget := sslTargetTCP || sslTargetUDP
-	if err := validateCerts(opts, sslListen, sslListenUDP, sslTarget); err != nil {
+	if err := validateSSL(opts, sslListen, sslListenUDP, sslTarget); err != nil {
 		return nil, err
 	}
 
 	return &Config{
-		Mode:       ModeForward,
-		Target:     target.ep,
-		Listen:     listen.ep,
-		KeyPath:    opts.keyPath,
-		CertPath:   opts.certPath,
-		CAPath:     opts.caPath,
-		Verify:     opts.verify,
-		SignCAPath: opts.signCAPath,
-		ServerName: opts.serverName,
-		LogLevel:   opts.logLevel,
-		Verbose:    opts.verbose,
+		Mode:   ModeForward,
+		Target: target.ep,
+		Listen: listen.ep,
+		ClientTLS: ClientTLSConfig{
+			KeyPath:  opts.q.keyPath,
+			CertPath: opts.q.certPath,
+			CAPath:   opts.q.caPath,
+			Verify:   opts.q.verify,
+		},
+		ServerTLS: ServerTLSConfig{
+			KeyPath:      opts.z.keyPath,
+			CertPath:     opts.z.certPath,
+			CAPath:       opts.z.caPath,
+			VerifyClient: opts.z.verify,
+		},
+		MITM: MITMConfig{
+			SignCAPath:   opts.m.signCAPath,
+			ServerName:   opts.m.serverName,
+			CAPath:       opts.m.caPath,
+			VerifyClient: opts.m.verify,
+		},
+		LogLevel: opts.logLevel,
+		Verbose:  opts.verbose,
 	}, nil
+}
+
+// sslScope accumulates the -key=/-cert=/-ca=/-verify= sub-options given
+// under a -Q or -Z block (see sslBlockScope). verify defaults to true; it
+// is false only when -verify=0 was given within this block.
+type sslScope struct {
+	keyPath, certPath, caPath string
+	verify                    bool
+	// seen reports whether the block's own -Q/-Z token was given at all,
+	// regardless of whether any sub-options followed it.
+	seen bool
+}
+
+// mitmScope accumulates the -signca=/-servername=/-ca=/-verify=
+// sub-options given under a -M block.
+type mitmScope struct {
+	signCAPath, serverName, caPath string
+	verify                         bool
+	seen                           bool
 }
 
 // options holds every -flag= gopr accepts, before the target/listen
 // positional arguments have been parsed.
 type options struct {
-	keyPath, certPath, caPath string
-	signCAPath, serverName    string
-	verify                    bool
-	// verifySet reports whether -verify= was given at all (regardless of
-	// its value), so proxy/socks mode -- where verify has no effect -- can
-	// still reject it per SKILL.md, distinct from verify's zero value.
-	verifySet     bool
+	q sslScope  // -Q <SSL>: TLS/DTLS origination toward <target>
+	z sslScope  // -Z <SSL>: static TLS/DTLS termination on <listen>
+	m mitmScope // -M <MITM>: generated-certificate termination on <listen>
+
 	help, version bool
 	// logLevel is the highest of any -d/-dd/-ddd given (0 if none), per
 	// socat's stacking convention; see Config.LogLevel.
@@ -215,13 +264,37 @@ var logLevelTokens = map[string]int{
 	"-ddd": 3,
 }
 
-// extractOptions consumes leading -key=/-cert=/-ca=/-verify=/-signca=/
-// -servername=/-d/-dd/-ddd/-v/-help/-version tokens (any order, each at
-// most once except -d/-dd/-ddd/-v which may repeat) and returns the
-// remaining positional arguments. verify defaults to true; it is false only
-// when -verify=0 was given.
+// sslScopeKind identifies which of -Q/-Z/-M block is currently open while
+// walking the option tokens, so a following -key=/-cert=/-ca=/-verify=/
+// -signca=/-servername= sub-option is assigned to the right one.
+type sslScopeKind int
+
+const (
+	scopeNone sslScopeKind = iota
+	scopeQ
+	scopeZ
+	scopeM
+)
+
+// extractOptions consumes leading option tokens (any order) and returns the
+// remaining positional arguments.
+//
+// -Q, -Z, and -M each open a scope, at most once apiece, that every
+// following -key=/-cert=/-ca=/-verify= (under -Q or -Z) or -signca=/
+// -servername=/-ca=/-verify= (under -M) sub-option belongs to, until the
+// next -Q/-Z/-M token or the first positional argument. A sub-option
+// appearing before any scope has been opened is an error. -d/-dd/-ddd/-v/
+// -help/-version are global and do not open or close a scope; they may
+// appear anywhere among the option tokens, including inside a -Q/-Z/-M
+// block, without affecting it.
+//
+// verify defaults to true within each scope; it is false only when
+// -verify=0 was given inside that scope.
 func extractOptions(args []string) (options, []string, error) {
-	opts := options{verify: true}
+	opts := options{}
+	opts.q.verify, opts.z.verify, opts.m.verify = true, true, true
+	scope := scopeNone
+
 	i := 0
 	for ; i < len(args); i++ {
 		tok := args[i]
@@ -236,34 +309,105 @@ func extractOptions(args []string) (options, []string, error) {
 			if lvl := logLevelTokens[tok]; lvl > opts.logLevel {
 				opts.logLevel = lvl
 			}
+		case tok == "-Q":
+			if opts.q.seen {
+				return options{}, nil, errors.New("-Q specified more than once")
+			}
+			opts.q.seen = true
+			scope = scopeQ
+		case tok == "-Z":
+			if opts.z.seen {
+				return options{}, nil, errors.New("-Z specified more than once")
+			}
+			opts.z.seen = true
+			scope = scopeZ
+		case tok == "-M":
+			if opts.m.seen {
+				return options{}, nil, errors.New("-M specified more than once")
+			}
+			opts.m.seen = true
+			scope = scopeM
 		case strings.HasPrefix(tok, "-key="):
-			if opts.keyPath != "" {
-				return options{}, nil, errors.New("-key= specified more than once")
+			val := strings.TrimPrefix(tok, "-key=")
+			switch scope {
+			case scopeQ:
+				if opts.q.keyPath != "" {
+					return options{}, nil, errors.New("-Q -key= specified more than once")
+				}
+				opts.q.keyPath = val
+			case scopeZ:
+				if opts.z.keyPath != "" {
+					return options{}, nil, errors.New("-Z -key= specified more than once")
+				}
+				opts.z.keyPath = val
+			default:
+				return options{}, nil, errors.New("-key= requires -Q or -Z before it")
 			}
-			opts.keyPath = strings.TrimPrefix(tok, "-key=")
 		case strings.HasPrefix(tok, "-cert="):
-			if opts.certPath != "" {
-				return options{}, nil, errors.New("-cert= specified more than once")
+			val := strings.TrimPrefix(tok, "-cert=")
+			switch scope {
+			case scopeQ:
+				if opts.q.certPath != "" {
+					return options{}, nil, errors.New("-Q -cert= specified more than once")
+				}
+				opts.q.certPath = val
+			case scopeZ:
+				if opts.z.certPath != "" {
+					return options{}, nil, errors.New("-Z -cert= specified more than once")
+				}
+				opts.z.certPath = val
+			default:
+				return options{}, nil, errors.New("-cert= requires -Q or -Z before it")
 			}
-			opts.certPath = strings.TrimPrefix(tok, "-cert=")
 		case strings.HasPrefix(tok, "-ca="):
-			if opts.caPath != "" {
-				return options{}, nil, errors.New("-ca= specified more than once")
+			val := strings.TrimPrefix(tok, "-ca=")
+			switch scope {
+			case scopeQ:
+				if opts.q.caPath != "" {
+					return options{}, nil, errors.New("-Q -ca= specified more than once")
+				}
+				opts.q.caPath = val
+			case scopeZ:
+				if opts.z.caPath != "" {
+					return options{}, nil, errors.New("-Z -ca= specified more than once")
+				}
+				opts.z.caPath = val
+			case scopeM:
+				if opts.m.caPath != "" {
+					return options{}, nil, errors.New("-M -ca= specified more than once")
+				}
+				opts.m.caPath = val
+			default:
+				return options{}, nil, errors.New("-ca= requires -Q, -Z, or -M before it")
 			}
-			opts.caPath = strings.TrimPrefix(tok, "-ca=")
-		case strings.HasPrefix(tok, "-signca="):
-			if opts.signCAPath != "" {
-				return options{}, nil, errors.New("-signca= specified more than once")
-			}
-			opts.signCAPath = strings.TrimPrefix(tok, "-signca=")
-		case strings.HasPrefix(tok, "-servername="):
-			if opts.serverName != "" {
-				return options{}, nil, errors.New("-servername= specified more than once")
-			}
-			opts.serverName = strings.TrimPrefix(tok, "-servername=")
 		case strings.HasPrefix(tok, "-verify="):
-			opts.verify = strings.TrimPrefix(tok, "-verify=") != "0"
-			opts.verifySet = true
+			val := strings.TrimPrefix(tok, "-verify=") != "0"
+			switch scope {
+			case scopeQ:
+				opts.q.verify = val
+			case scopeZ:
+				opts.z.verify = val
+			case scopeM:
+				opts.m.verify = val
+			default:
+				return options{}, nil, errors.New("-verify= requires -Q, -Z, or -M before it")
+			}
+		case strings.HasPrefix(tok, "-signca="):
+			if scope != scopeM {
+				return options{}, nil, errors.New("-signca= requires -M before it")
+			}
+			if opts.m.signCAPath != "" {
+				return options{}, nil, errors.New("-M -signca= specified more than once")
+			}
+			opts.m.signCAPath = strings.TrimPrefix(tok, "-signca=")
+		case strings.HasPrefix(tok, "-servername="):
+			if scope != scopeM {
+				return options{}, nil, errors.New("-servername= requires -M before it")
+			}
+			if opts.m.serverName != "" {
+				return options{}, nil, errors.New("-M -servername= specified more than once")
+			}
+			opts.m.serverName = strings.TrimPrefix(tok, "-servername=")
 		default:
 			return opts, args[i:], nil
 		}
@@ -468,45 +612,58 @@ func validatePort(p string) error {
 	return nil
 }
 
-// validateCerts enforces SKILL.md's -key=/-cert=/-signca=/-servername=
-// combination rules. sslListen/sslTarget report whether /SSL takes effect
-// on the listen (decode) and target (encode) side respectively (TCP TLS
-// or UDP DTLS, or both); sslListenUDP separately reports whether the
-// listen side's DTLS (UDP) half is active, since -signca= (MITM) only
-// covers TLS termination over TCP.
-func validateCerts(opts options, sslListen, sslListenUDP, sslTarget bool) error {
-	if opts.signCAPath != "" {
-		if opts.keyPath != "" || opts.certPath != "" {
-			return errors.New("-signca= cannot be combined with -key=/-cert=")
-		}
-		if !sslListen {
-			return errors.New("-signca= requires TLS termination on the listen side (.../SSL on <listen>)")
-		}
-		if sslListenUDP {
-			return errors.New("-signca= does not support DTLS termination over UDP; use -cert=/-key= instead, or drop /UDP from the listen side")
-		}
-		if sslTarget {
-			return errors.New("-signca= cannot be combined with TLS origination toward target (<target>/SSL); use -key=/-cert= instead")
-		}
-		return nil
+// validateSSL enforces SKILL.md's -Q/-Z/-M combination rules. sslListen/
+// sslTarget report whether /SSL takes effect on the listen (decode) and
+// target (encode) side respectively (TCP TLS or UDP DTLS, or both);
+// sslListenUDP separately reports whether the listen side's DTLS (UDP)
+// half is active, since -M (MITM) only covers TLS termination over TCP.
+func validateSSL(opts options, sslListen, sslListenUDP, sslTarget bool) error {
+	if opts.z.seen && opts.m.seen {
+		return errors.New("-Z and -M cannot both be specified (mutually exclusive server-side TLS options)")
 	}
-	if opts.serverName != "" {
-		return errors.New("-servername= requires -signca=")
+	if opts.q.seen && !sslTarget {
+		return errors.New("-Q requires TLS/DTLS origination toward target (<target>/SSL)")
+	}
+	if opts.z.seen && !sslListen {
+		return errors.New("-Z requires TLS/DTLS termination on listen (<listen>/SSL)")
+	}
+	if opts.m.seen && !sslListen {
+		return errors.New("-M requires TLS termination on listen (<listen>/SSL)")
+	}
+	if opts.m.seen && sslListenUDP {
+		return errors.New("-M does not support DTLS termination over UDP; use -Z with -key=/-cert= instead, or drop /UDP from the listen side")
+	}
+	if opts.m.serverName != "" && opts.m.signCAPath == "" {
+		return errors.New("-M -servername= requires -M -signca=")
 	}
 
-	if opts.keyPath != "" && opts.certPath == "" {
-		return errors.New("-key= was specified without -cert=")
+	if err := validateSSLKeyCert("-Q", opts.q.keyPath, opts.q.certPath); err != nil {
+		return err
 	}
-	if (sslListen || sslTarget) && opts.certPath == "" {
-		return errors.New("/SSL requires -cert= (or -signca= on the listen side) to be specified")
+	if err := validateSSLKeyCert("-Z", opts.z.keyPath, opts.z.certPath); err != nil {
+		return err
 	}
-	if opts.certPath != "" && opts.keyPath == "" {
-		embedded, err := tlsutil.HasEmbeddedKey(opts.certPath)
+	if sslListen && opts.z.certPath == "" && opts.m.signCAPath == "" {
+		return errors.New("<listen>/SSL requires -Z -cert= (or -M -signca=) to be specified")
+	}
+	return nil
+}
+
+// validateSSLKeyCert enforces the -key=/-cert= pairing rule shared by -Q
+// and -Z's blocks: -key= alone is an error, and a -cert= without -key=
+// must embed its own private key. label ("-Q" or "-Z") only decorates the
+// error messages.
+func validateSSLKeyCert(label, keyPath, certPath string) error {
+	if keyPath != "" && certPath == "" {
+		return fmt.Errorf("%s -key= was specified without -cert=", label)
+	}
+	if certPath != "" && keyPath == "" {
+		embedded, err := tlsutil.HasEmbeddedKey(certPath)
 		if err != nil {
-			return fmt.Errorf("failed to read -cert=%s: %w", opts.certPath, err)
+			return fmt.Errorf("failed to read %s -cert=%s: %w", label, certPath, err)
 		}
 		if !embedded {
-			return fmt.Errorf("-cert=%s does not contain a private key; -key= is required", opts.certPath)
+			return fmt.Errorf("%s -cert=%s does not contain a private key; -key= is required", label, certPath)
 		}
 	}
 	return nil

@@ -79,24 +79,28 @@ func splitHostPort(addr string) (host, port string, err error) {
 }
 
 func clientTLSConfig(cfg *config.Config) (*tls.Config, error) {
-	return tlsutil.ClientConfig(cfg.CertPath, cfg.KeyPath, cfg.CAPath, serverName(cfg.Target.Addr), cfg.Verify)
+	c := cfg.ClientTLS
+	return tlsutil.ClientConfig(c.CertPath, c.KeyPath, c.CAPath, serverName(cfg.Target.Addr), c.Verify)
 }
 
 func serverTLSConfig(cfg *config.Config) (*tls.Config, error) {
-	if cfg.SignCAPath != "" {
-		signer, err := tlsutil.LoadMITMSigner(cfg.SignCAPath)
+	if cfg.MITM.SignCAPath != "" {
+		signer, err := tlsutil.LoadMITMSigner(cfg.MITM.SignCAPath)
 		if err != nil {
 			return nil, err
 		}
-		return tlsutil.MITMServerConfig(signer, cfg.ServerName, cfg.CAPath)
+		return tlsutil.MITMServerConfig(signer, cfg.MITM.ServerName, cfg.MITM.CAPath, cfg.MITM.VerifyClient)
 	}
-	return tlsutil.ServerConfig(cfg.CertPath, cfg.KeyPath, cfg.CAPath)
+	s := cfg.ServerTLS
+	return tlsutil.ServerConfig(s.CertPath, s.KeyPath, s.CAPath, s.VerifyClient)
 }
 
 func clientDTLSConfig(cfg *config.Config) (*dtls.Config, error) {
-	return tlsutil.ClientConfigDTLS(cfg.CertPath, cfg.KeyPath, cfg.CAPath, serverName(cfg.Target.Addr), cfg.Verify)
+	c := cfg.ClientTLS
+	return tlsutil.ClientConfigDTLS(c.CertPath, c.KeyPath, c.CAPath, serverName(cfg.Target.Addr), c.Verify)
 }
 
 func serverDTLSConfig(cfg *config.Config) (*dtls.Config, error) {
-	return tlsutil.ServerConfigDTLS(cfg.CertPath, cfg.KeyPath, cfg.CAPath)
+	s := cfg.ServerTLS
+	return tlsutil.ServerConfigDTLS(s.CertPath, s.KeyPath, s.CAPath, s.VerifyClient)
 }

@@ -115,7 +115,7 @@ func TestParseTLS(t *testing.T) {
 	keyOnly := writePEM(t, dir, "key_only.pem", keyBlock())
 
 	t.Run("TLS termination, separate key and cert", func(t *testing.T) {
-		cfg, err := Parse([]string{"-key=" + keyOnly, "-cert=" + certNoKey, "192.168.0.2:7777", "8888/SSL"})
+		cfg, err := Parse([]string{"-Z", "-key=" + keyOnly, "-cert=" + certNoKey, "192.168.0.2:7777", "8888/SSL"})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -128,44 +128,60 @@ func TestParseTLS(t *testing.T) {
 	})
 
 	t.Run("TLS termination, cert with embedded key", func(t *testing.T) {
-		cfg, err := Parse([]string{"-cert=" + certWithKey, "192.168.0.2:7777", "8888/SSL"})
+		cfg, err := Parse([]string{"-Z", "-cert=" + certWithKey, "192.168.0.2:7777", "8888/SSL"})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if cfg.KeyPath != "" {
-			t.Errorf("KeyPath = %q, want empty", cfg.KeyPath)
+		if cfg.ServerTLS.KeyPath != "" {
+			t.Errorf("ServerTLS.KeyPath = %q, want empty", cfg.ServerTLS.KeyPath)
 		}
 	})
 
-	t.Run("mTLS with -ca=", func(t *testing.T) {
+	t.Run("mTLS with -Z -ca=", func(t *testing.T) {
 		ca := writePEM(t, dir, "client_ca.pem", certBlock())
-		cfg, err := Parse([]string{"-key=" + keyOnly, "-cert=" + certNoKey, "-ca=" + ca, "192.168.0.2:7777", "8888/SSL"})
+		cfg, err := Parse([]string{"-Z", "-key=" + keyOnly, "-cert=" + certNoKey, "-ca=" + ca, "192.168.0.2:7777", "8888/SSL"})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if cfg.CAPath != ca {
-			t.Errorf("CAPath = %q, want %q", cfg.CAPath, ca)
+		if cfg.ServerTLS.CAPath != ca {
+			t.Errorf("ServerTLS.CAPath = %q, want %q", cfg.ServerTLS.CAPath, ca)
 		}
 	})
 
-	t.Run("UDP-only DTLS origination requires -cert=", func(t *testing.T) {
-		if _, err := Parse([]string{"192.168.0.2:7777/SSL", "8888/UDP"}); err == nil {
-			t.Fatal("expected error: DTLS origination toward target requires -cert=")
+	t.Run("listen-side /SSL with no -Z/-M at all is an error", func(t *testing.T) {
+		if _, err := Parse([]string{"192.168.0.2:7777", "8888/UDP/SSL"}); err == nil {
+			t.Fatal("expected error: listen-side SSL requires -Z -cert= or -M -signca=")
 		}
 	})
 
-	t.Run("UDP-only DTLS origination with -cert= is valid", func(t *testing.T) {
-		cfg, err := Parse([]string{"-key=" + keyOnly, "-cert=" + certNoKey, "192.168.0.2:7777/SSL", "8888/UDP"})
+	t.Run("target-side TLS origination needs no certificate at all", func(t *testing.T) {
+		cfg, err := Parse([]string{"192.168.0.2:7777/SSL", "8888/UDP"})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		if !cfg.Target.UDP || !cfg.Target.SSL || cfg.Target.TCP {
 			t.Errorf("Target = %+v, want UDP+SSL only", cfg.Target)
 		}
+		if cfg.ClientTLS.CertPath != "" {
+			t.Errorf("ClientTLS.CertPath = %q, want empty", cfg.ClientTLS.CertPath)
+		}
 	})
 
-	t.Run("TCP/UDP dual: TLS on TCP and DTLS on UDP, same cert", func(t *testing.T) {
-		cfg, err := Parse([]string{"-key=" + keyOnly, "-cert=" + certNoKey, "192.168.0.2:7777", "8888/TCP/UDP/SSL"})
+	t.Run("target-side TLS origination with -Q client cert is valid", func(t *testing.T) {
+		cfg, err := Parse([]string{"-Q", "-key=" + keyOnly, "-cert=" + certNoKey, "192.168.0.2:7777/SSL", "8888/UDP"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !cfg.Target.UDP || !cfg.Target.SSL || cfg.Target.TCP {
+			t.Errorf("Target = %+v, want UDP+SSL only", cfg.Target)
+		}
+		if cfg.ClientTLS.CertPath != certNoKey {
+			t.Errorf("ClientTLS.CertPath = %q, want %q", cfg.ClientTLS.CertPath, certNoKey)
+		}
+	})
+
+	t.Run("TCP/UDP dual: TLS on TCP and DTLS on UDP, same -Z cert", func(t *testing.T) {
+		cfg, err := Parse([]string{"-Z", "-key=" + keyOnly, "-cert=" + certNoKey, "192.168.0.2:7777", "8888/TCP/UDP/SSL"})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -177,16 +193,8 @@ func TestParseTLS(t *testing.T) {
 		}
 	})
 
-	t.Run("TLS origination toward target", func(t *testing.T) {
-		cfg, err := Parse([]string{"192.168.0.2:7777/SSL", "8888"})
-		// No -cert= given: cert is required whenever /SSL takes effect.
-		if err == nil {
-			t.Fatalf("Parse(%v) = %+v, want error (-cert= required)", []string{"192.168.0.2:7777/SSL", "8888"}, cfg)
-		}
-	})
-
-	t.Run("TLS origination toward target with client cert", func(t *testing.T) {
-		cfg, err := Parse([]string{"-key=" + keyOnly, "-cert=" + certNoKey, "-ca=" + certNoKey, "192.168.0.2:7777/SSL", "8888"})
+	t.Run("TLS origination toward target with client cert via -Q", func(t *testing.T) {
+		cfg, err := Parse([]string{"-Q", "-key=" + keyOnly, "-cert=" + certNoKey, "-ca=" + certNoKey, "192.168.0.2:7777/SSL", "8888"})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -196,7 +204,7 @@ func TestParseTLS(t *testing.T) {
 	})
 
 	t.Run("lowercase and mixed-case-between-tokens suffixes", func(t *testing.T) {
-		cfg, err := Parse([]string{"-key=" + keyOnly, "-cert=" + certNoKey, "192.168.0.2:7777", "8888/tcp/udp/ssl"})
+		cfg, err := Parse([]string{"-Z", "-key=" + keyOnly, "-cert=" + certNoKey, "192.168.0.2:7777", "8888/tcp/udp/ssl"})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -204,7 +212,7 @@ func TestParseTLS(t *testing.T) {
 			t.Errorf("Listen = %+v, want TCP+UDP+SSL", cfg.Listen)
 		}
 
-		cfg2, err := Parse([]string{"-key=" + keyOnly, "-cert=" + certNoKey, "192.168.0.2:7777", "8888/TCP/ssl"})
+		cfg2, err := Parse([]string{"-Z", "-key=" + keyOnly, "-cert=" + certNoKey, "192.168.0.2:7777", "8888/TCP/ssl"})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -212,6 +220,85 @@ func TestParseTLS(t *testing.T) {
 			t.Errorf("Listen = %+v, want TCP+SSL only", cfg2.Listen)
 		}
 	})
+}
+
+// TestParseDoubleTLS covers the new -Q + -Z combination: TLS termination on
+// listen and TLS origination toward a (possibly different) target, each
+// with its own independent certificate configuration.
+func TestParseDoubleTLS(t *testing.T) {
+	dir := t.TempDir()
+	serverCert := writePEM(t, dir, "server.pem", certBlock(), keyBlock())
+	clientCert := writePEM(t, dir, "client.pem", certBlock(), keyBlock())
+	serverCA := writePEM(t, dir, "server_ca.pem", certBlock())
+
+	cfg, err := Parse([]string{
+		"-Q", "-cert=" + clientCert, "-ca=" + serverCA,
+		"-Z", "-cert=" + serverCert,
+		"192.0.2.11:7777/ssl", "8888/ssl",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cfg.Target.SSL || !cfg.Listen.SSL {
+		t.Fatalf("Target.SSL=%v Listen.SSL=%v, want both true", cfg.Target.SSL, cfg.Listen.SSL)
+	}
+	if cfg.ClientTLS.CertPath != clientCert || cfg.ClientTLS.CAPath != serverCA {
+		t.Errorf("ClientTLS = %+v, want CertPath=%q CAPath=%q", cfg.ClientTLS, clientCert, serverCA)
+	}
+	if cfg.ServerTLS.CertPath != serverCert {
+		t.Errorf("ServerTLS.CertPath = %q, want %q", cfg.ServerTLS.CertPath, serverCert)
+	}
+
+	t.Run("order between -Q and -Z blocks doesn't matter", func(t *testing.T) {
+		cfg2, err := Parse([]string{
+			"-Z", "-cert=" + serverCert,
+			"-Q", "-cert=" + clientCert, "-ca=" + serverCA,
+			"192.0.2.11:7777/ssl", "8888/ssl",
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg2.ClientTLS.CertPath != clientCert || cfg2.ServerTLS.CertPath != serverCert {
+			t.Errorf("cfg2 = %+v, unexpected", cfg2)
+		}
+	})
+}
+
+func TestParseScopeErrors(t *testing.T) {
+	dir := t.TempDir()
+	certNoKey := writePEM(t, dir, "no_key.pem", certBlock())
+
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{"-key= before any -Q/-Z is an error", []string{"-key=k.pem", "192.168.0.2:7777", "8888"}},
+		{"-cert= before any -Q/-Z is an error", []string{"-cert=" + certNoKey, "192.168.0.2:7777", "8888"}},
+		{"-ca= before any -Q/-Z/-M is an error", []string{"-ca=ca.pem", "192.168.0.2:7777", "8888"}},
+		{"-verify= before any -Q/-Z/-M is an error", []string{"-verify=0", "192.168.0.2:7777", "8888"}},
+		{"-signca= before -M is an error", []string{"-signca=ca.pem", "192.168.0.2:7777", "8888/SSL"}},
+		{"-servername= before -M is an error", []string{"-servername=x", "192.168.0.2:7777", "8888/SSL"}},
+		{"-cert= is not a valid -M sub-option", []string{"-M", "-cert=" + certNoKey, "192.168.0.2:7777", "8888/SSL"}},
+		{"-key= is not a valid -M sub-option", []string{"-M", "-key=k.pem", "192.168.0.2:7777", "8888/SSL"}},
+		{"duplicate -Q is an error", []string{"-Q", "-Q", "192.168.0.2:7777/SSL", "8888"}},
+		{"duplicate -Z is an error", []string{"-Z", "-Z", "192.168.0.2:7777", "8888/SSL"}},
+		{"duplicate -M is an error", []string{"-M", "-M", "192.168.0.2:7777", "8888/SSL"}},
+		{"-Q without target-side /SSL is an error", []string{"-Q", "192.168.0.2:7777", "8888"}},
+		{"-Z without listen-side /SSL is an error", []string{"-Z", "-cert=" + certNoKey, "192.168.0.2:7777", "8888"}},
+		{"-M without listen-side /SSL is an error", []string{"-M", "-signca=ca.pem", "192.168.0.2:7777", "8888"}},
+		{"-Z and -M together are an error", []string{
+			"-Z", "-cert=" + certNoKey,
+			"-M", "-signca=ca.pem",
+			"192.168.0.2:7777", "8888/SSL",
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := Parse(tt.args); err == nil {
+				t.Fatalf("Parse(%v) succeeded, want error", tt.args)
+			}
+		})
+	}
 }
 
 func TestParseProxyModes(t *testing.T) {
@@ -267,21 +354,21 @@ func TestParseProxyModes(t *testing.T) {
 		}
 	})
 
-	t.Run("proxy with -cert= is an error", func(t *testing.T) {
-		if _, err := Parse([]string{"-cert=/x.pem", "proxy", "8888"}); err == nil {
-			t.Fatal("expected error combining proxy mode with -cert=")
+	t.Run("proxy with -Z -cert= is an error", func(t *testing.T) {
+		if _, err := Parse([]string{"-Z", "-cert=/x.pem", "proxy", "8888"}); err == nil {
+			t.Fatal("expected error combining proxy mode with -Z -cert=")
 		}
 	})
 
-	t.Run("proxy with -verify= is an error", func(t *testing.T) {
-		if _, err := Parse([]string{"-verify=0", "proxy", "8888"}); err == nil {
-			t.Fatal("expected error combining proxy mode with -verify=")
+	t.Run("proxy with -Q -verify= is an error", func(t *testing.T) {
+		if _, err := Parse([]string{"-Q", "-verify=0", "proxy", "8888"}); err == nil {
+			t.Fatal("expected error combining proxy mode with -Q -verify=")
 		}
 	})
 
-	t.Run("upstream chain with -verify= is an error", func(t *testing.T) {
-		if _, err := Parse([]string{"-verify=0", "192.0.2.11:7777/proxy", "8888"}); err == nil {
-			t.Fatal("expected error combining upstream proxy chain with -verify=")
+	t.Run("upstream chain with -Q -verify= is an error", func(t *testing.T) {
+		if _, err := Parse([]string{"-Q", "-verify=0", "192.0.2.11:7777/proxy", "8888"}); err == nil {
+			t.Fatal("expected error combining upstream proxy chain with -Q -verify=")
 		}
 	})
 
@@ -352,9 +439,9 @@ func TestParseProxyModes(t *testing.T) {
 		}
 	})
 
-	t.Run("upstream chain with -cert= is an error", func(t *testing.T) {
-		if _, err := Parse([]string{"-cert=/x.pem", "192.0.2.11:7777/proxy", "8888"}); err == nil {
-			t.Fatal("expected error combining upstream proxy chain with -cert=")
+	t.Run("upstream chain with -Z -cert= is an error", func(t *testing.T) {
+		if _, err := Parse([]string{"-Z", "-cert=/x.pem", "192.0.2.11:7777/proxy", "8888"}); err == nil {
+			t.Fatal("expected error combining upstream proxy chain with -Z -cert=")
 		}
 	})
 
@@ -393,8 +480,8 @@ func TestParseErrors(t *testing.T) {
 		{"too many args", []string{"192.168.0.2:7777", "8888", "extra"}},
 		{"target missing port", []string{"192.168.0.2", "8888"}},
 		{"target missing port, hostname", []string{"backend.internal", "8888"}},
-		{"key without cert", []string{"-key=" + keyOnly, "192.168.0.2:7777", "8888"}},
-		{"cert without key and without embedded key", []string{"-cert=" + certNoKey, "192.168.0.2:7777", "8888"}},
+		{"-Z -key= without -cert=", []string{"-Z", "-key=" + keyOnly, "192.168.0.2:7777", "8888"}},
+		{"-Z -cert= without key and without embedded key", []string{"-Z", "-cert=" + certNoKey, "192.168.0.2:7777", "8888"}},
 		{"SSL without cert", []string{"192.168.0.2:7777", "8888/SSL"}},
 		{"mixed case suffix", []string{"192.168.0.2:7777/Tcp", "8888"}},
 		{"unknown suffix", []string{"192.168.0.2:7777/FOO", "8888"}},
@@ -407,7 +494,7 @@ func TestParseErrors(t *testing.T) {
 		{"port zero", []string{"192.168.0.2:0", "8888"}},
 		{"invalid port", []string{"192.168.0.2:abc", "8888"}},
 		{"bare hostname listen without port", []string{"192.168.0.2:7777", "example.com"}},
-		{"duplicate cert option", []string{"-cert=a.pem", "-cert=b.pem", "192.168.0.2:7777", "8888"}},
+		{"duplicate -Z -cert=", []string{"-Z", "-cert=a.pem", "-cert=b.pem", "192.168.0.2:7777", "8888"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -425,9 +512,9 @@ func TestOptionOrderIndependence(t *testing.T) {
 	ca := writePEM(t, dir, "ca.pem", certBlock())
 
 	orders := [][]string{
-		{"-cert=" + certNoKey, "-key=" + keyOnly, "-ca=" + ca},
-		{"-key=" + keyOnly, "-ca=" + ca, "-cert=" + certNoKey},
-		{"-ca=" + ca, "-cert=" + certNoKey, "-key=" + keyOnly},
+		{"-Z", "-cert=" + certNoKey, "-key=" + keyOnly, "-ca=" + ca},
+		{"-Z", "-key=" + keyOnly, "-ca=" + ca, "-cert=" + certNoKey},
+		{"-Z", "-ca=" + ca, "-cert=" + certNoKey, "-key=" + keyOnly},
 	}
 	for _, opts := range orders {
 		args := append(append([]string{}, opts...), "192.168.0.2:7777", "8888/SSL")
@@ -435,8 +522,8 @@ func TestOptionOrderIndependence(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Parse(%v) error = %v", args, err)
 		}
-		if cfg.KeyPath != keyOnly || cfg.CertPath != certNoKey || cfg.CAPath != ca {
-			t.Errorf("Parse(%v) = key=%q cert=%q ca=%q", args, cfg.KeyPath, cfg.CertPath, cfg.CAPath)
+		if cfg.ServerTLS.KeyPath != keyOnly || cfg.ServerTLS.CertPath != certNoKey || cfg.ServerTLS.CAPath != ca {
+			t.Errorf("Parse(%v) = %+v", args, cfg.ServerTLS)
 		}
 	}
 }
@@ -444,45 +531,73 @@ func TestOptionOrderIndependence(t *testing.T) {
 func TestECPrivateKeyDetected(t *testing.T) {
 	dir := t.TempDir()
 	certWithECKey := writePEM(t, dir, "ec.pem", certBlock(), ecKeyBlock())
-	cfg, err := Parse([]string{"-cert=" + certWithECKey, "192.168.0.2:7777", "8888/SSL"})
+	cfg, err := Parse([]string{"-Z", "-cert=" + certWithECKey, "192.168.0.2:7777", "8888/SSL"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if cfg.KeyPath != "" {
-		t.Errorf("KeyPath = %q, want empty (EC PRIVATE KEY should be detected as embedded)", cfg.KeyPath)
+	if cfg.ServerTLS.KeyPath != "" {
+		t.Errorf("ServerTLS.KeyPath = %q, want empty (EC PRIVATE KEY should be detected as embedded)", cfg.ServerTLS.KeyPath)
 	}
 }
 
 func TestParseVerify(t *testing.T) {
-	t.Run("verify defaults to true", func(t *testing.T) {
+	t.Run("-Q verify defaults to true", func(t *testing.T) {
 		cfg, err := Parse([]string{"192.168.0.2:7777", "8888"})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if !cfg.Verify {
-			t.Errorf("Verify = false, want true when -verify= is omitted")
+		if !cfg.ClientTLS.Verify {
+			t.Errorf("ClientTLS.Verify = false, want true when -verify= is omitted")
 		}
 	})
 
-	t.Run("-verify=0 disables verification", func(t *testing.T) {
-		cfg, err := Parse([]string{"-verify=0", "192.168.0.2:7777", "8888"})
+	t.Run("-Q -verify=0 disables target certificate verification", func(t *testing.T) {
+		cfg, err := Parse([]string{"-Q", "-verify=0", "192.168.0.2:7777/SSL", "8888"})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if cfg.Verify {
-			t.Errorf("Verify = true, want false when -verify=0 is given")
+		if cfg.ClientTLS.Verify {
+			t.Errorf("ClientTLS.Verify = true, want false when -Q -verify=0 is given")
 		}
 	})
 
-	t.Run("-verify=0 combines with other options in any order", func(t *testing.T) {
+	t.Run("-Q -verify=0 combines with other -Q options in any order", func(t *testing.T) {
 		dir := t.TempDir()
 		certWithKey := writePEM(t, dir, "with_key.pem", certBlock(), keyBlock())
-		cfg, err := Parse([]string{"-verify=0", "-cert=" + certWithKey, "192.168.0.2:7777/SSL", "8888"})
+		cfg, err := Parse([]string{"-Q", "-verify=0", "-cert=" + certWithKey, "192.168.0.2:7777/SSL", "8888"})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if cfg.Verify {
-			t.Errorf("Verify = true, want false")
+		if cfg.ClientTLS.Verify {
+			t.Errorf("ClientTLS.Verify = true, want false")
+		}
+	})
+
+	t.Run("-Z verify defaults to true", func(t *testing.T) {
+		dir := t.TempDir()
+		cert := writePEM(t, dir, "s.pem", certBlock(), keyBlock())
+		cfg, err := Parse([]string{"-Z", "-cert=" + cert, "192.168.0.2:7777", "8888/SSL"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !cfg.ServerTLS.VerifyClient {
+			t.Errorf("ServerTLS.VerifyClient = false, want true when -verify= is omitted")
+		}
+	})
+
+	t.Run("-Z -verify=0 still requires but does not verify the client certificate", func(t *testing.T) {
+		dir := t.TempDir()
+		cert := writePEM(t, dir, "s.pem", certBlock(), keyBlock())
+		ca := writePEM(t, dir, "ca.pem", certBlock())
+		cfg, err := Parse([]string{"-Z", "-cert=" + cert, "-ca=" + ca, "-verify=0", "192.168.0.2:7777", "8888/SSL"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.ServerTLS.VerifyClient {
+			t.Errorf("ServerTLS.VerifyClient = true, want false when -Z -verify=0 is given")
+		}
+		if cfg.ServerTLS.CAPath != ca {
+			t.Errorf("ServerTLS.CAPath = %q, want %q", cfg.ServerTLS.CAPath, ca)
 		}
 	})
 }
@@ -556,6 +671,18 @@ func TestParseLogLevelAndVerbose(t *testing.T) {
 			t.Errorf("cfg = %+v, want ModeHTTPProxy/level=3/verbose=true", cfg)
 		}
 	})
+
+	t.Run("-d/-v inside a -Q/-Z block don't affect its scope", func(t *testing.T) {
+		dir := t.TempDir()
+		cert := writePEM(t, dir, "s.pem", certBlock(), keyBlock())
+		cfg, err := Parse([]string{"-Z", "-key=" + cert, "-d", "-cert=" + cert, "-v", "192.168.0.2:7777", "8888/SSL"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.ServerTLS.CertPath != cert || cfg.LogLevel != 1 || !cfg.Verbose {
+			t.Errorf("cfg = %+v, unexpected", cfg)
+		}
+	})
 }
 
 func TestParseVersion(t *testing.T) {
@@ -570,7 +697,7 @@ func TestParseVersion(t *testing.T) {
 	})
 
 	t.Run("-version takes precedence over other options and missing positional args", func(t *testing.T) {
-		cfg, err := Parse([]string{"-cert=/x.pem", "-version"})
+		cfg, err := Parse([]string{"-Z", "-cert=/x.pem", "-version"})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -592,7 +719,7 @@ func TestParseHelp(t *testing.T) {
 	})
 
 	t.Run("-help takes precedence over other options and missing positional args", func(t *testing.T) {
-		cfg, err := Parse([]string{"-cert=/x.pem", "-help"})
+		cfg, err := Parse([]string{"-Z", "-cert=/x.pem", "-help"})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -705,105 +832,135 @@ func TestParseAllMultiGroup(t *testing.T) {
 	})
 }
 
-func TestParseSignCA(t *testing.T) {
-	t.Run("-signca= alone with listen-side SSL is valid", func(t *testing.T) {
-		cfg, err := Parse([]string{"-signca=/ca.pem", "192.0.2.11:7777", "8888/SSL"})
+func TestParseMITM(t *testing.T) {
+	t.Run("-M -signca= alone with listen-side SSL is valid", func(t *testing.T) {
+		cfg, err := Parse([]string{"-M", "-signca=/ca.pem", "192.0.2.11:7777", "8888/SSL"})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if cfg.SignCAPath != "/ca.pem" {
-			t.Errorf("SignCAPath = %q, want /ca.pem", cfg.SignCAPath)
+		if cfg.MITM.SignCAPath != "/ca.pem" {
+			t.Errorf("MITM.SignCAPath = %q, want /ca.pem", cfg.MITM.SignCAPath)
 		}
-		if cfg.CertPath != "" || cfg.KeyPath != "" {
-			t.Errorf("CertPath=%q KeyPath=%q, want both empty", cfg.CertPath, cfg.KeyPath)
-		}
-	})
-
-	t.Run("-signca= with -cert= is an error", func(t *testing.T) {
-		if _, err := Parse([]string{"-signca=/ca.pem", "-cert=/x.pem", "192.0.2.11:7777", "8888/SSL"}); err == nil {
-			t.Fatal("expected error combining -signca= with -cert=")
+		if cfg.ServerTLS.CertPath != "" || cfg.ServerTLS.KeyPath != "" {
+			t.Errorf("ServerTLS = %+v, want empty", cfg.ServerTLS)
 		}
 	})
 
-	t.Run("-signca= with -key= is an error", func(t *testing.T) {
-		if _, err := Parse([]string{"-signca=/ca.pem", "-key=/x.key", "192.0.2.11:7777", "8888/SSL"}); err == nil {
-			t.Fatal("expected error combining -signca= with -key=")
+	t.Run("-M combined with -Z is an error", func(t *testing.T) {
+		if _, err := Parse([]string{"-M", "-signca=/ca.pem", "-Z", "-cert=/x.pem", "192.0.2.11:7777", "8888/SSL"}); err == nil {
+			t.Fatal("expected error combining -M with -Z")
 		}
 	})
 
-	t.Run("-signca= without listen-side SSL is an error", func(t *testing.T) {
-		if _, err := Parse([]string{"-signca=/ca.pem", "192.0.2.11:7777", "8888"}); err == nil {
-			t.Fatal("expected error: -signca= requires /SSL on the listen side")
+	t.Run("-M without listen-side SSL is an error", func(t *testing.T) {
+		if _, err := Parse([]string{"-M", "-signca=/ca.pem", "192.0.2.11:7777", "8888"}); err == nil {
+			t.Fatal("expected error: -M requires /SSL on the listen side")
 		}
 	})
 
-	t.Run("-signca= with SSL only on target side is an error", func(t *testing.T) {
-		if _, err := Parse([]string{"-signca=/ca.pem", "192.0.2.11:7777/SSL", "8888"}); err == nil {
-			t.Fatal("expected error: -signca= requires listen-side SSL, not target-side")
+	t.Run("-M with SSL only on target side (no listen SSL) is an error", func(t *testing.T) {
+		if _, err := Parse([]string{"-M", "-signca=/ca.pem", "192.0.2.11:7777/SSL", "8888"}); err == nil {
+			t.Fatal("expected error: -M requires listen-side SSL")
 		}
 	})
 
-	t.Run("-signca= with SSL on both target and listen is an error", func(t *testing.T) {
-		if _, err := Parse([]string{"-signca=/ca.pem", "192.0.2.11:7777/SSL", "8888/SSL"}); err == nil {
-			t.Fatal("expected error: -signca= cannot combine with target-side TLS origination")
-		}
-	})
-
-	t.Run("-signca= with listen-side UDP+SSL (DTLS) is an error", func(t *testing.T) {
-		if _, err := Parse([]string{"-signca=/ca.pem", "192.0.2.11:7777", "8888/TCP/UDP/SSL"}); err == nil {
-			t.Fatal("expected error: -signca= does not support DTLS termination over UDP")
-		}
-	})
-
-	t.Run("-signca= combined with -ca= for mTLS client verification is valid", func(t *testing.T) {
-		cfg, err := Parse([]string{"-signca=/ca.pem", "-ca=/client-ca.pem", "192.0.2.11:7777", "8888/SSL"})
+	t.Run("-M with SSL on both target and listen is valid (MITM termination + TLS origination)", func(t *testing.T) {
+		cfg, err := Parse([]string{"-M", "-signca=/ca.pem", "192.0.2.11:7777/SSL", "8888/SSL"})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if cfg.CAPath != "/client-ca.pem" {
-			t.Errorf("CAPath = %q, want /client-ca.pem", cfg.CAPath)
+		if !cfg.Target.SSL || !cfg.Listen.SSL {
+			t.Errorf("Target.SSL=%v Listen.SSL=%v, want both true", cfg.Target.SSL, cfg.Listen.SSL)
+		}
+	})
+
+	t.Run("-M with SSL on both sides plus -Q for the target side is valid", func(t *testing.T) {
+		dir := t.TempDir()
+		clientCert := writePEM(t, dir, "client.pem", certBlock(), keyBlock())
+		cfg, err := Parse([]string{
+			"-M", "-signca=/ca.pem",
+			"-Q", "-cert=" + clientCert,
+			"192.0.2.11:7777/SSL", "8888/SSL",
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.ClientTLS.CertPath != clientCert {
+			t.Errorf("ClientTLS.CertPath = %q, want %q", cfg.ClientTLS.CertPath, clientCert)
+		}
+		if cfg.MITM.SignCAPath != "/ca.pem" {
+			t.Errorf("MITM.SignCAPath = %q, want /ca.pem", cfg.MITM.SignCAPath)
+		}
+	})
+
+	t.Run("-M with listen-side UDP+SSL (DTLS) is an error", func(t *testing.T) {
+		if _, err := Parse([]string{"-M", "-signca=/ca.pem", "192.0.2.11:7777", "8888/TCP/UDP/SSL"}); err == nil {
+			t.Fatal("expected error: -M does not support DTLS termination over UDP")
+		}
+	})
+
+	t.Run("-M -ca= for mTLS client verification is valid", func(t *testing.T) {
+		cfg, err := Parse([]string{"-M", "-signca=/ca.pem", "-ca=/client-ca.pem", "192.0.2.11:7777", "8888/SSL"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.MITM.CAPath != "/client-ca.pem" {
+			t.Errorf("MITM.CAPath = %q, want /client-ca.pem", cfg.MITM.CAPath)
+		}
+		if !cfg.MITM.VerifyClient {
+			t.Errorf("MITM.VerifyClient = false, want true (default)")
+		}
+	})
+
+	t.Run("-M -verify=0 still requires but does not verify the client certificate", func(t *testing.T) {
+		cfg, err := Parse([]string{"-M", "-signca=/ca.pem", "-ca=/client-ca.pem", "-verify=0", "192.0.2.11:7777", "8888/SSL"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.MITM.VerifyClient {
+			t.Errorf("MITM.VerifyClient = true, want false")
 		}
 	})
 
 	t.Run("duplicate -signca= is an error", func(t *testing.T) {
-		if _, err := Parse([]string{"-signca=/a.pem", "-signca=/b.pem", "192.0.2.11:7777", "8888/SSL"}); err == nil {
+		if _, err := Parse([]string{"-M", "-signca=/a.pem", "-signca=/b.pem", "192.0.2.11:7777", "8888/SSL"}); err == nil {
 			t.Fatal("expected error for duplicate -signca=")
 		}
 	})
 
-	t.Run("-signca= combined with proxy mode is an error", func(t *testing.T) {
-		if _, err := Parse([]string{"-signca=/ca.pem", "proxy", "8888"}); err == nil {
-			t.Fatal("expected error combining proxy mode with -signca=")
+	t.Run("-M combined with proxy mode is an error", func(t *testing.T) {
+		if _, err := Parse([]string{"-M", "-signca=/ca.pem", "proxy", "8888"}); err == nil {
+			t.Fatal("expected error combining proxy mode with -M")
 		}
 	})
 }
 
 func TestParseServerName(t *testing.T) {
-	t.Run("-servername= without -signca= is an error", func(t *testing.T) {
-		if _, err := Parse([]string{"-servername=example.com", "192.0.2.11:7777", "8888/SSL"}); err == nil {
-			t.Fatal("expected error: -servername= requires -signca=")
+	t.Run("-M -servername= without -signca= is an error", func(t *testing.T) {
+		if _, err := Parse([]string{"-M", "-servername=example.com", "192.0.2.11:7777", "8888/SSL"}); err == nil {
+			t.Fatal("expected error: -M -servername= requires -M -signca=")
 		}
 	})
 
-	t.Run("-servername= with -signca= is valid", func(t *testing.T) {
-		cfg, err := Parse([]string{"-signca=/ca.pem", "-servername=example.com", "192.0.2.11:7777", "8888/SSL"})
+	t.Run("-M -servername= with -signca= is valid", func(t *testing.T) {
+		cfg, err := Parse([]string{"-M", "-signca=/ca.pem", "-servername=example.com", "192.0.2.11:7777", "8888/SSL"})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if cfg.ServerName != "example.com" {
-			t.Errorf("ServerName = %q, want example.com", cfg.ServerName)
+		if cfg.MITM.ServerName != "example.com" {
+			t.Errorf("MITM.ServerName = %q, want example.com", cfg.MITM.ServerName)
 		}
 	})
 
 	t.Run("duplicate -servername= is an error", func(t *testing.T) {
-		if _, err := Parse([]string{"-signca=/ca.pem", "-servername=a.com", "-servername=b.com", "192.0.2.11:7777", "8888/SSL"}); err == nil {
+		if _, err := Parse([]string{"-M", "-signca=/ca.pem", "-servername=a.com", "-servername=b.com", "192.0.2.11:7777", "8888/SSL"}); err == nil {
 			t.Fatal("expected error for duplicate -servername=")
 		}
 	})
 
 	t.Run("-servername= combined with proxy mode is an error", func(t *testing.T) {
-		if _, err := Parse([]string{"-servername=example.com", "proxy", "8888"}); err == nil {
-			t.Fatal("expected error combining proxy mode with -servername=")
+		if _, err := Parse([]string{"-M", "-servername=example.com", "proxy", "8888"}); err == nil {
+			t.Fatal("expected error combining proxy mode with -M -servername=")
 		}
 	})
 }

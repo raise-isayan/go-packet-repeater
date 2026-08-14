@@ -12,7 +12,7 @@ func TestServerConfigDTLS(t *testing.T) {
 	certPath := writeTestCA(t, dir)
 
 	t.Run("loads certificate", func(t *testing.T) {
-		cfg, err := ServerConfigDTLS(certPath, "", "")
+		cfg, err := ServerConfigDTLS(certPath, "", "", true)
 		if err != nil {
 			t.Fatalf("ServerConfigDTLS: %v", err)
 		}
@@ -26,7 +26,7 @@ func TestServerConfigDTLS(t *testing.T) {
 
 	t.Run("with CA requires and verifies client cert", func(t *testing.T) {
 		caPath := writeTestCA(t, dir)
-		cfg, err := ServerConfigDTLS(certPath, "", caPath)
+		cfg, err := ServerConfigDTLS(certPath, "", caPath, true)
 		if err != nil {
 			t.Fatalf("ServerConfigDTLS: %v", err)
 		}
@@ -38,8 +38,19 @@ func TestServerConfigDTLS(t *testing.T) {
 		}
 	})
 
+	t.Run("with CA and verifyClient=false requires but does not verify client cert", func(t *testing.T) {
+		caPath := writeTestCA(t, dir)
+		cfg, err := ServerConfigDTLS(certPath, "", caPath, false)
+		if err != nil {
+			t.Fatalf("ServerConfigDTLS: %v", err)
+		}
+		if cfg.ClientAuth != dtls.RequireAnyClientCert {
+			t.Errorf("ClientAuth = %v, want RequireAnyClientCert", cfg.ClientAuth)
+		}
+	})
+
 	t.Run("missing cert file is an error", func(t *testing.T) {
-		if _, err := ServerConfigDTLS(filepath.Join(dir, "missing.pem"), "", ""); err == nil {
+		if _, err := ServerConfigDTLS(filepath.Join(dir, "missing.pem"), "", "", true); err == nil {
 			t.Fatal("expected error for missing cert file")
 		}
 	})

@@ -182,7 +182,7 @@ tasks.register('test') {
     }
 }
 
-tasks.register('goBuildAll') {
+tasks.register('buildAll') {
     group = 'build'
     description = "Cross-compiles ${appName} for every target GOOS/GOARCH into ${distDir.name}/."
 
@@ -235,10 +235,10 @@ tasks.register('goBuildAll') {
     }
 }
 
-tasks.register('goReleaseAll') {
+tasks.register('releaseAll') {
     group = 'build'
     description = "Zips every binary from ${distDir.name}/ into ${releaseDir.name}/ (builds missing binaries first)."
-    dependsOn 'goBuildAll'
+    dependsOn 'buildAll'
 
     doLast {
         releaseDir.mkdirs()
@@ -270,7 +270,7 @@ tasks.register('goReleaseAll') {
     }
 }
 
-tasks.register('cleanl', Delete) {
+tasks.register('clean', Delete) {
     group = 'build'
     description = "Removes the output all directory."
     def binFile = targetBin()

@@ -11,8 +11,8 @@ import (
 
 // ServerConfigDTLS builds the dtls.Config used to terminate DTLS on the
 // listen side (decode: DTLS -> plaintext) over UDP. Mirrors ServerConfig;
-// there is no DTLS equivalent of MITMServerConfig (-signca= is TCP-only).
-func ServerConfigDTLS(certPath, keyPath, caPath string) (*dtls.Config, error) {
+// there is no DTLS equivalent of MITMServerConfig (-M is TCP-only).
+func ServerConfigDTLS(certPath, keyPath, caPath string, verifyClient bool) (*dtls.Config, error) {
 	cert, err := loadCertificate(certPath, keyPath)
 	if err != nil {
 		return nil, err
@@ -24,7 +24,11 @@ func ServerConfigDTLS(certPath, keyPath, caPath string) (*dtls.Config, error) {
 			return nil, err
 		}
 		cfg.ClientCAs = pool
-		cfg.ClientAuth = dtls.RequireAndVerifyClientCert
+		if verifyClient {
+			cfg.ClientAuth = dtls.RequireAndVerifyClientCert
+		} else {
+			cfg.ClientAuth = dtls.RequireAnyClientCert
+		}
 	}
 	return cfg, nil
 }

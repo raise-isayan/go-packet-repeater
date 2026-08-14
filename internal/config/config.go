@@ -37,6 +37,55 @@ type Endpoint struct {
 	SSL bool
 }
 
+// ClientTLSConfig is the -Q <SSL> block: how gopr behaves as a TLS/DTLS
+// client originating encryption toward Target.
+type ClientTLSConfig struct {
+	// KeyPath/CertPath, if set, present a client certificate to Target.
+	// Both are optional -- a plain TLS/DTLS client needs neither.
+	KeyPath, CertPath string
+	// CAPath, if set, verifies Target's certificate against this CA
+	// instead of the system root pool.
+	CAPath string
+	// Verify reports whether Target's certificate is validated at all.
+	// False only when -verify=0 was given under -Q; true (the default)
+	// otherwise.
+	Verify bool
+}
+
+// ServerTLSConfig is the -Z <SSL> block: a static certificate for TLS/DTLS
+// termination on Listen.
+type ServerTLSConfig struct {
+	// KeyPath/CertPath are this side's own certificate, required whenever
+	// Listen.SSL is set (unless MITM is used instead).
+	KeyPath, CertPath string
+	// CAPath, if set, requests and verifies a client certificate from the
+	// connecting peer (mTLS).
+	CAPath string
+	// VerifyClient reports whether a client certificate presented under
+	// CAPath is validated against it. False only when -verify=0 was given
+	// under -Z; true (the default) otherwise. Has no effect when CAPath is
+	// empty (no client certificate is requested at all).
+	VerifyClient bool
+}
+
+// MITMConfig is the -M <MITM> block: mints a per-connection leaf
+// certificate for TLS termination on Listen instead of a static
+// ServerTLSConfig certificate.
+type MITMConfig struct {
+	// SignCAPath is a PEM file containing a CA certificate *and* its
+	// private key (-signca=), used to sign generated leaf certificates.
+	SignCAPath string
+	// ServerName, when set (-servername=), is the hostname used for the
+	// generated leaf certificate's CN/SAN, overriding whatever SNI the
+	// connecting client presents.
+	ServerName string
+	// CAPath, if set, requests and verifies a client certificate from the
+	// connecting peer (mTLS), exactly as ServerTLSConfig.CAPath.
+	CAPath string
+	// VerifyClient behaves exactly as ServerTLSConfig.VerifyClient.
+	VerifyClient bool
+}
+
 // Config is the fully parsed and validated representation of a gopr
 // command line.
 type Config struct {
@@ -59,26 +108,19 @@ type Config struct {
 	// form, which dials directly as before.
 	UpstreamAddr string
 
-	KeyPath  string
-	CertPath string
-	CAPath   string
-	// Verify reports whether the TLS certificate presented by the remote
-	// side of a connection is validated. False only when -verify=0 was
-	// given; true (the default) otherwise.
-	Verify bool
-
-	// SignCAPath, if set, is a PEM file containing a CA certificate *and*
-	// its private key (-signca=). It switches TLS termination on the
-	// listen side from a static -cert=/-key= pair to on-the-fly leaf
-	// certificates, minted per hostname and signed by this CA (MITM mode).
-	// Mutually exclusive with KeyPath/CertPath; only valid when Listen.SSL
-	// is set and Target.SSL is not.
-	SignCAPath string
-	// ServerName, when set (-servername=), is the hostname used for the
-	// generated leaf certificate's CN/SAN, overriding whatever SNI the
-	// connecting client presents. Only meaningful together with
-	// SignCAPath.
-	ServerName string
+	// ClientTLS holds the -Q <SSL> block: gopr's own TLS/DTLS behavior when
+	// it acts as the client originating encryption toward Target (only
+	// meaningful when Target.SSL is set).
+	ClientTLS ClientTLSConfig
+	// ServerTLS holds the -Z <SSL> block: a static certificate for TLS/DTLS
+	// termination on Listen (only meaningful when Listen.SSL is set).
+	// Mutually exclusive with MITM.
+	ServerTLS ServerTLSConfig
+	// MITM holds the -M <MITM> block: an alternative to ServerTLS that
+	// mints a per-connection leaf certificate for TLS termination on
+	// Listen instead of using a static certificate. Mutually exclusive
+	// with ServerTLS; TCP only (no DTLS/UDP support).
+	MITM MITMConfig
 
 	// LogLevel selects how much diagnostic detail gopr prints, following
 	// socat's -d stacking convention: 0 (default, no -d) is errors only,
