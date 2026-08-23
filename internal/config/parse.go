@@ -28,11 +28,10 @@ const Usage = `gopr [option] <target> <listen>
   [-Z <SSL>]              ; SSL server option: static TLS/DTLS termination
                           ; on <listen>. Requires <listen>/SSL. Mutually
                           ; exclusive with -M.
-  [-M <MITM>]             ; SSL server MITM option: per-connection generated
-                          ; certificate for TLS termination on <listen>,
-                          ; instead of -Z's static certificate. Requires
-                          ; <listen>/SSL; TCP only. Mutually exclusive
-                          ; with -Z.
+  [-M <MITM>]             ; SSL server MITM option: generated certificate
+                          ; for TLS/DTLS termination on <listen>, instead
+                          ; of -Z's static certificate. Requires
+                          ; <listen>/SSL. Mutually exclusive with -Z.
   [-d | -dd | -ddd]       ; debug output; each additional d prints one more,
                           ; less severe tier of diagnostics (socat-style):
                           ; -d = connection/session lifecycle, -dd = adds
@@ -61,7 +60,9 @@ const Usage = `gopr [option] <target> <listen>
   [-signca=<path>]        ; CA (cert + private key) used to mint a leaf
                           ; certificate per connection for TLS termination
   [-servername=<value>]   ; hostname for the generated certificate;
-                          ; overrides the client's SNI
+                          ; overrides the client's SNI. Required (not
+                          ; optional) when <listen>/UDP/SSL is active, since
+                          ; DTLS clients don't reliably send SNI
   [-ca=<path>]            ; same as -Z's -ca= (mTLS)
   [-verify=<value>]       ; same as -Z's -verify=`
 
@@ -616,7 +617,8 @@ func validatePort(p string) error {
 // sslTarget report whether /SSL takes effect on the listen (decode) and
 // target (encode) side respectively (TCP TLS or UDP DTLS, or both);
 // sslListenUDP separately reports whether the listen side's DTLS (UDP)
-// half is active, since -M (MITM) only covers TLS termination over TCP.
+// half is active, since -M (MITM) requires -servername= in that case
+// (DTLS clients don't reliably send SNI the way TLS clients do).
 func validateSSL(opts options, sslListen, sslListenUDP, sslTarget bool) error {
 	if opts.z.seen && opts.m.seen {
 		return errors.New("-Z and -M cannot both be specified (mutually exclusive server-side TLS options)")
@@ -628,10 +630,10 @@ func validateSSL(opts options, sslListen, sslListenUDP, sslTarget bool) error {
 		return errors.New("-Z requires TLS/DTLS termination on listen (<listen>/SSL)")
 	}
 	if opts.m.seen && !sslListen {
-		return errors.New("-M requires TLS termination on listen (<listen>/SSL)")
+		return errors.New("-M requires TLS/DTLS termination on listen (<listen>/SSL)")
 	}
-	if opts.m.seen && sslListenUDP {
-		return errors.New("-M does not support DTLS termination over UDP; use -Z with -key=/-cert= instead, or drop /UDP from the listen side")
+	if opts.m.seen && sslListenUDP && opts.m.serverName == "" {
+		return errors.New("-M -servername= is required when terminating DTLS over UDP (<listen>/UDP/SSL); DTLS clients don't reliably send SNI, unlike TLS over TCP")
 	}
 	if opts.m.serverName != "" && opts.m.signCAPath == "" {
 		return errors.New("-M -servername= requires -M -signca=")

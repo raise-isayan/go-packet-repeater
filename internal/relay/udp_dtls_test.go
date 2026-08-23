@@ -63,6 +63,45 @@ func writeLeafCert(t *testing.T, dir string) string {
 	return p
 }
 
+// writeSignCA generates a self-signed CA certificate and private key,
+// written together to a single PEM file, matching the -signca= format gopr
+// expects for -M.
+func writeSignCA(t *testing.T, dir string) string {
+	t.Helper()
+
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generating CA key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "gopr test signing CA"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("creating CA certificate: %v", err)
+	}
+
+	var data []byte
+	data = append(data, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})...)
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatalf("marshaling CA key: %v", err)
+	}
+	data = append(data, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})...)
+
+	p := filepath.Join(dir, "signca.pem")
+	if err := os.WriteFile(p, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
 // freeUDPPort returns a currently-unused UDP port on 127.0.0.1 by briefly
 // binding to port 0 and closing again.
 func freeUDPPort(t *testing.T) int {
@@ -201,6 +240,70 @@ func TestServeUDPDTLSDecodeOnly(t *testing.T) {
 	}
 	if !bytes.Equal(buf[:n], payload) {
 		t.Errorf("echoed payload = %q, want %q", buf[:n], payload)
+	}
+}
+
+// TestServeUDPDTLSMITMRequiresServerName verifies that -M (MITM) DTLS
+// termination over UDP mints its leaf certificate from -servername=
+// (Config.MITM.ServerName) rather than from the client's SNI, matching
+// serverDTLSConfig's use of MITMServerConfigDTLS.
+func TestServeUDPDTLSMITMRequiresServerName(t *testing.T) {
+	dir := t.TempDir()
+	signCAPath := writeSignCA(t, dir)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	targetAddr := fmt.Sprintf("127.0.0.1:%d", freeUDPPort(t))
+	runPlaintextUDPEcho(t, ctx, targetAddr)
+
+	listenAddr := fmt.Sprintf("127.0.0.1:%d", freeUDPPort(t))
+	cfg := &config.Config{
+		Listen: config.Endpoint{Addr: listenAddr, UDP: true, SSL: true},
+		Target: config.Endpoint{Addr: targetAddr, UDP: true},
+		MITM:   config.MITMConfig{SignCAPath: signCAPath, ServerName: "mitm.example.com"},
+	}
+	go serveUDPDTLS(ctx, cfg, logx.New(logx.LevelDebug, false))
+
+	conn := dialDTLSWithRetry(t, listenAddr, &dtls.Config{InsecureSkipVerify: true})
+	defer conn.Close()
+
+	// dtls.Dial does not perform the handshake eagerly (it happens lazily
+	// on the first Read/Write), so exercise both before inspecting
+	// ConnectionState.
+	payload := []byte("hello over mitm dtls")
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, 1024)
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if !bytes.Equal(buf[:n], payload) {
+		t.Errorf("echoed payload = %q, want %q", buf[:n], payload)
+	}
+
+	dtlsConn, ok := conn.(*dtls.Conn)
+	if !ok {
+		t.Fatalf("conn is %T, want *dtls.Conn", conn)
+	}
+	state, ok := dtlsConn.ConnectionState()
+	if !ok {
+		t.Fatal("ConnectionState: handshake not complete")
+	}
+	// The MITM leaf certificate is sent together with the signing CA
+	// (see MITMSigner.CertificateFor), so the client sees both.
+	if len(state.PeerCertificates) != 2 {
+		t.Fatalf("PeerCertificates = %d, want 2 (leaf + signing CA)", len(state.PeerCertificates))
+	}
+	leaf, err := x509.ParseCertificate(state.PeerCertificates[0])
+	if err != nil {
+		t.Fatalf("parsing leaf certificate: %v", err)
+	}
+	if leaf.Subject.CommonName != "mitm.example.com" {
+		t.Errorf("leaf certificate CommonName = %q, want mitm.example.com (from -servername=, not SNI)", leaf.Subject.CommonName)
 	}
 }
 

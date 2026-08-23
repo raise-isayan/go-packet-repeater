@@ -893,9 +893,9 @@ func TestParseMITM(t *testing.T) {
 		}
 	})
 
-	t.Run("-M with listen-side UDP+SSL (DTLS) is an error", func(t *testing.T) {
+	t.Run("-M with listen-side UDP+SSL (DTLS) without -servername= is an error", func(t *testing.T) {
 		if _, err := Parse([]string{"-M", "-signca=/ca.pem", "192.0.2.11:7777", "8888/TCP/UDP/SSL"}); err == nil {
-			t.Fatal("expected error: -M does not support DTLS termination over UDP")
+			t.Fatal("expected error: -M -servername= is required for DTLS termination over UDP")
 		}
 	})
 
@@ -931,6 +931,36 @@ func TestParseMITM(t *testing.T) {
 	t.Run("-M combined with proxy mode is an error", func(t *testing.T) {
 		if _, err := Parse([]string{"-M", "-signca=/ca.pem", "proxy", "8888"}); err == nil {
 			t.Fatal("expected error combining proxy mode with -M")
+		}
+	})
+
+	t.Run("-M with listen-side UDP+SSL (DTLS) and -servername= is valid", func(t *testing.T) {
+		cfg, err := Parse([]string{"-M", "-signca=/ca.pem", "-servername=example.com", "192.0.2.11:7777", "8888/UDP/SSL"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.MITM.ServerName != "example.com" {
+			t.Errorf("MITM.ServerName = %q, want example.com", cfg.MITM.ServerName)
+		}
+	})
+
+	t.Run("-M with listen-side TCP+UDP+SSL and -servername= is valid", func(t *testing.T) {
+		cfg, err := Parse([]string{"-M", "-signca=/ca.pem", "-servername=example.com", "192.0.2.11:7777", "8888/TCP/UDP/SSL"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !cfg.Listen.TCP || !cfg.Listen.UDP {
+			t.Errorf("Listen.TCP=%v Listen.UDP=%v, want both true", cfg.Listen.TCP, cfg.Listen.UDP)
+		}
+	})
+
+	t.Run("-M with listen-side TCP-only+SSL still works without -servername= (SNI fallback)", func(t *testing.T) {
+		cfg, err := Parse([]string{"-M", "-signca=/ca.pem", "192.0.2.11:7777", "8888/TCP/SSL"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.MITM.ServerName != "" {
+			t.Errorf("MITM.ServerName = %q, want empty", cfg.MITM.ServerName)
 		}
 	})
 }

@@ -101,6 +101,13 @@ func clientDTLSConfig(cfg *config.Config) (*dtls.Config, error) {
 }
 
 func serverDTLSConfig(cfg *config.Config) (*dtls.Config, error) {
+	if cfg.MITM.SignCAPath != "" {
+		signer, err := tlsutil.LoadMITMSigner(cfg.MITM.SignCAPath)
+		if err != nil {
+			return nil, err
+		}
+		return tlsutil.MITMServerConfigDTLS(signer, cfg.MITM.ServerName, cfg.MITM.CAPath, cfg.MITM.VerifyClient)
+	}
 	s := cfg.ServerTLS
 	return tlsutil.ServerConfigDTLS(s.CertPath, s.KeyPath, s.CAPath, s.VerifyClient)
 }

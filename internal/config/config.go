@@ -32,8 +32,8 @@ type Endpoint struct {
 	UDP bool
 	// SSL reports whether this specific side is encrypted: TLS over its
 	// TCP half, DTLS over its UDP half, whichever of the two are active
-	// for this relay. Both share the same -cert=/-key=/-ca= (or -signca=,
-	// TCP only) options.
+	// for this relay. Both share the same -cert=/-key=/-ca= (or -signca=)
+	// options.
 	SSL bool
 }
 
@@ -77,7 +77,10 @@ type MITMConfig struct {
 	SignCAPath string
 	// ServerName, when set (-servername=), is the hostname used for the
 	// generated leaf certificate's CN/SAN, overriding whatever SNI the
-	// connecting client presents.
+	// connecting client presents. Required (not just optional) whenever
+	// Listen's UDP half is active, since DTLS clients don't reliably send
+	// SNI the way TLS clients do; TCP alone can still fall back to
+	// per-connection SNI when this is empty.
 	ServerName string
 	// CAPath, if set, requests and verifies a client certificate from the
 	// connecting peer (mTLS), exactly as ServerTLSConfig.CAPath.
@@ -117,9 +120,10 @@ type Config struct {
 	// Mutually exclusive with MITM.
 	ServerTLS ServerTLSConfig
 	// MITM holds the -M <MITM> block: an alternative to ServerTLS that
-	// mints a per-connection leaf certificate for TLS termination on
-	// Listen instead of using a static certificate. Mutually exclusive
-	// with ServerTLS; TCP only (no DTLS/UDP support).
+	// mints a leaf certificate for TLS/DTLS termination on Listen instead
+	// of using a static certificate. Mutually exclusive with ServerTLS.
+	// Covers both the TCP (TLS) and UDP (DTLS) halves of Listen; see
+	// MITMConfig.ServerName for the UDP-specific -servername= requirement.
 	MITM MITMConfig
 
 	// LogLevel selects how much diagnostic detail gopr prints, following

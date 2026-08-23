@@ -1,6 +1,7 @@
 package tlsutil
 
 import (
+	"crypto/x509"
 	"path/filepath"
 	"testing"
 
@@ -52,6 +53,63 @@ func TestServerConfigDTLS(t *testing.T) {
 	t.Run("missing cert file is an error", func(t *testing.T) {
 		if _, err := ServerConfigDTLS(filepath.Join(dir, "missing.pem"), "", "", true); err == nil {
 			t.Fatal("expected error for missing cert file")
+		}
+	})
+}
+
+func TestMITMServerConfigDTLS(t *testing.T) {
+	dir := t.TempDir()
+	caPath := writeTestCA(t, dir)
+	signer, err := LoadMITMSigner(caPath)
+	if err != nil {
+		t.Fatalf("LoadMITMSigner: %v", err)
+	}
+
+	t.Run("mints a certificate for the explicit server name", func(t *testing.T) {
+		cfg, err := MITMServerConfigDTLS(signer, "example.com", "", true)
+		if err != nil {
+			t.Fatalf("MITMServerConfigDTLS: %v", err)
+		}
+		if len(cfg.Certificates) != 1 {
+			t.Fatalf("Certificates = %d, want 1", len(cfg.Certificates))
+		}
+		leaf, err := x509.ParseCertificate(cfg.Certificates[0].Certificate[0])
+		if err != nil {
+			t.Fatalf("parsing leaf: %v", err)
+		}
+		if leaf.Subject.CommonName != "example.com" {
+			t.Errorf("CommonName = %q, want example.com", leaf.Subject.CommonName)
+		}
+	})
+
+	t.Run("empty server name is an error (no SNI fallback over DTLS)", func(t *testing.T) {
+		if _, err := MITMServerConfigDTLS(signer, "", "", true); err == nil {
+			t.Fatal("expected error for empty -servername= over DTLS")
+		}
+	})
+
+	t.Run("with CA requires and verifies client cert", func(t *testing.T) {
+		caPath := writeTestCA(t, dir)
+		cfg, err := MITMServerConfigDTLS(signer, "example.com", caPath, true)
+		if err != nil {
+			t.Fatalf("MITMServerConfigDTLS: %v", err)
+		}
+		if cfg.ClientCAs == nil {
+			t.Error("ClientCAs = nil, want populated pool")
+		}
+		if cfg.ClientAuth != dtls.RequireAndVerifyClientCert {
+			t.Errorf("ClientAuth = %v, want RequireAndVerifyClientCert", cfg.ClientAuth)
+		}
+	})
+
+	t.Run("with CA and verifyClient=false requires but does not verify client cert", func(t *testing.T) {
+		caPath := writeTestCA(t, dir)
+		cfg, err := MITMServerConfigDTLS(signer, "example.com", caPath, false)
+		if err != nil {
+			t.Fatalf("MITMServerConfigDTLS: %v", err)
+		}
+		if cfg.ClientAuth != dtls.RequireAnyClientCert {
+			t.Errorf("ClientAuth = %v, want RequireAnyClientCert", cfg.ClientAuth)
 		}
 	})
 }
