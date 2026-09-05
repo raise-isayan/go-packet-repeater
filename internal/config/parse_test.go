@@ -467,6 +467,106 @@ func TestParseProxyModes(t *testing.T) {
 	})
 }
 
+func TestParseForwardAuth(t *testing.T) {
+	t.Run("HTTP proxy chain with -F -user=", func(t *testing.T) {
+		cfg, err := Parse([]string{"-F", "-user=alice:s3cret", "192.0.2.11:7777/proxy", "8888"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.ForwardAuth.User != "alice" || cfg.ForwardAuth.Pass != "s3cret" {
+			t.Errorf("ForwardAuth = %+v, want User=alice Pass=s3cret", cfg.ForwardAuth)
+		}
+	})
+
+	t.Run("SOCKS chain with -F -user=", func(t *testing.T) {
+		cfg, err := Parse([]string{"-F", "-user=alice:s3cret", "192.0.2.11:7777/socks", "8888"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.ForwardAuth.User != "alice" || cfg.ForwardAuth.Pass != "s3cret" {
+			t.Errorf("ForwardAuth = %+v, want User=alice Pass=s3cret", cfg.ForwardAuth)
+		}
+	})
+
+	t.Run("password may contain colons", func(t *testing.T) {
+		cfg, err := Parse([]string{"-F", "-user=alice:a:b:c", "192.0.2.11:7777/proxy", "8888"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.ForwardAuth.User != "alice" || cfg.ForwardAuth.Pass != "a:b:c" {
+			t.Errorf("ForwardAuth = %+v, want User=alice Pass=a:b:c", cfg.ForwardAuth)
+		}
+	})
+
+	t.Run("empty password is allowed", func(t *testing.T) {
+		cfg, err := Parse([]string{"-F", "-user=alice:", "192.0.2.11:7777/proxy", "8888"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.ForwardAuth.User != "alice" || cfg.ForwardAuth.Pass != "" {
+			t.Errorf("ForwardAuth = %+v, want User=alice Pass=empty", cfg.ForwardAuth)
+		}
+	})
+
+	t.Run("no -F leaves ForwardAuth zero", func(t *testing.T) {
+		cfg, err := Parse([]string{"192.0.2.11:7777/proxy", "8888"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.ForwardAuth != (ForwardAuthConfig{}) {
+			t.Errorf("ForwardAuth = %+v, want zero value", cfg.ForwardAuth)
+		}
+	})
+
+	t.Run("-F without -user= is an error", func(t *testing.T) {
+		if _, err := Parse([]string{"-F", "192.0.2.11:7777/proxy", "8888"}); err == nil {
+			t.Fatal("expected error: -F requires -user=")
+		}
+	})
+
+	t.Run("-F with bare proxy keyword is an error (no upstream to authenticate)", func(t *testing.T) {
+		if _, err := Parse([]string{"-F", "-user=alice:s3cret", "proxy", "8888"}); err == nil {
+			t.Fatal("expected error: -F requires upstream chaining")
+		}
+	})
+
+	t.Run("-F in plain forward mode is an error", func(t *testing.T) {
+		if _, err := Parse([]string{"-F", "-user=alice:s3cret", "192.0.2.11:7777", "8888"}); err == nil {
+			t.Fatal("expected error: -F is only valid with proxy/socks upstream chaining")
+		}
+	})
+
+	t.Run("-user= without -F is an error", func(t *testing.T) {
+		if _, err := Parse([]string{"-user=alice:s3cret", "192.0.2.11:7777/proxy", "8888"}); err == nil {
+			t.Fatal("expected error: -user= requires -F before it")
+		}
+	})
+
+	t.Run("-user= without a colon is an error", func(t *testing.T) {
+		if _, err := Parse([]string{"-F", "-user=alice", "192.0.2.11:7777/proxy", "8888"}); err == nil {
+			t.Fatal("expected error: -user= must be user:pass")
+		}
+	})
+
+	t.Run("-user= with empty user is an error", func(t *testing.T) {
+		if _, err := Parse([]string{"-F", "-user=:s3cret", "192.0.2.11:7777/proxy", "8888"}); err == nil {
+			t.Fatal("expected error: -user= requires a non-empty user")
+		}
+	})
+
+	t.Run("-F specified more than once is an error", func(t *testing.T) {
+		if _, err := Parse([]string{"-F", "-user=a:b", "-F", "192.0.2.11:7777/proxy", "8888"}); err == nil {
+			t.Fatal("expected error: -F specified more than once")
+		}
+	})
+
+	t.Run("-F -user= specified more than once is an error", func(t *testing.T) {
+		if _, err := Parse([]string{"-F", "-user=a:b", "-user=c:d", "192.0.2.11:7777/proxy", "8888"}); err == nil {
+			t.Fatal("expected error: -F -user= specified more than once")
+		}
+	})
+}
+
 func TestParseErrors(t *testing.T) {
 	dir := t.TempDir()
 	certNoKey := writePEM(t, dir, "no_key.pem", certBlock())

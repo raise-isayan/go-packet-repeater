@@ -5,6 +5,7 @@ package proxy
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"fmt"
 	"net"
 	"net/http"
@@ -26,22 +27,28 @@ import (
 // request is relayed through that upstream HTTP proxy instead of being
 // dialed directly: a CONNECT is issued to the upstream for tunneled
 // requests, and plain requests are sent via an http.Transport configured
-// with the upstream as its Proxy.
+// with the upstream as its Proxy. cfg.ForwardAuth (-F -user=), when set,
+// presents HTTP Basic credentials to that upstream proxy.
 func RunHTTP(ctx context.Context, cfg *config.Config) error {
 	log := logx.New(logx.Level(cfg.LogLevel), cfg.Verbose)
 	addr := cfg.Listen.Addr
 	upstream := cfg.UpstreamAddr
+	auth := cfg.ForwardAuth
 
 	transport := http.DefaultTransport
 	if upstream != "" {
-		transport = &http.Transport{Proxy: http.ProxyURL(&url.URL{Scheme: "http", Host: upstream})}
+		proxyURL := &url.URL{Scheme: "http", Host: upstream}
+		if auth.User != "" {
+			proxyURL.User = url.UserPassword(auth.User, auth.Pass)
+		}
+		transport = &http.Transport{Proxy: http.ProxyURL(proxyURL)}
 	}
 
 	srv := &http.Server{
 		Addr: addr,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method == http.MethodConnect {
-				handleConnect(w, r, log, upstream)
+				handleConnect(w, r, log, upstream, auth)
 				return
 			}
 			handleForward(w, r, log, transport)
@@ -70,8 +77,8 @@ func RunHTTP(ctx context.Context, cfg *config.Config) error {
 // handleConnect tunnels an HTTPS (or other TCP) connection through a
 // CONNECT request without decrypting it. When upstream is non-empty, the
 // tunnel is established via an upstream HTTP proxy (see dialUpstreamConnect)
-// instead of dialing r.Host directly.
-func handleConnect(w http.ResponseWriter, r *http.Request, log *logx.Logger, upstream string) {
+// instead of dialing r.Host directly, presenting auth's credentials if set.
+func handleConnect(w http.ResponseWriter, r *http.Request, log *logx.Logger, upstream string, auth config.ForwardAuthConfig) {
 	label := fmt.Sprintf("http-connect %s", r.Host)
 	log.Warn("%s: request from %s", label, r.RemoteAddr)
 	start := time.Now()
@@ -79,7 +86,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request, log *logx.Logger, ups
 	var dst net.Conn
 	var err error
 	if upstream != "" {
-		dst, err = dialUpstreamConnect(upstream, r.Host)
+		dst, err = dialUpstreamConnect(upstream, r.Host, auth)
 	} else {
 		dst, err = net.DialTimeout("tcp", r.Host, 10*time.Second)
 	}
@@ -174,8 +181,9 @@ func handleForward(w http.ResponseWriter, r *http.Request, log *logx.Logger, tra
 // dialUpstreamConnect dials upstream (an HTTP proxy address) and issues an
 // HTTP CONNECT request for targetHost, returning the tunneled connection
 // once the upstream reports success. Used by handleConnect when gopr's own
-// HTTP proxy is chained to an upstream one (cfg.UpstreamAddr).
-func dialUpstreamConnect(upstream, targetHost string) (net.Conn, error) {
+// HTTP proxy is chained to an upstream one (cfg.UpstreamAddr). When auth is
+// set, a Proxy-Authorization: Basic header is included.
+func dialUpstreamConnect(upstream, targetHost string, auth config.ForwardAuthConfig) (net.Conn, error) {
 	conn, err := net.DialTimeout("tcp", upstream, 10*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("dial upstream proxy %s: %w", upstream, err)
@@ -186,6 +194,10 @@ func dialUpstreamConnect(upstream, targetHost string) (net.Conn, error) {
 		URL:    &url.URL{Opaque: targetHost},
 		Host:   targetHost,
 		Header: make(http.Header),
+	}
+	if auth.User != "" {
+		creds := base64.StdEncoding.EncodeToString([]byte(auth.User + ":" + auth.Pass))
+		req.Header.Set("Proxy-Authorization", "Basic "+creds)
 	}
 	if err := req.Write(conn); err != nil {
 		conn.Close()

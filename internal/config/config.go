@@ -89,6 +89,18 @@ type MITMConfig struct {
 	VerifyClient bool
 }
 
+// ForwardAuthConfig is the -F <FORWARD> block: credentials gopr presents
+// to an upstream proxy/SOCKS server when chained via "<host:port>/proxy"
+// or "<host:port>/socks" (see Config.UpstreamAddr). Distinct from
+// ClientTLSConfig/ServerTLSConfig/MITMConfig, which are all TLS-specific;
+// this is plain proxy-protocol authentication (HTTP Basic, SOCKS5
+// username/password), unrelated to encryption.
+type ForwardAuthConfig struct {
+	// User and Pass are split from -F -user=<user:pass> on the first ':'.
+	// User is never empty when set (see validation in Parse); Pass may be.
+	User, Pass string
+}
+
 // Config is the fully parsed and validated representation of a gopr
 // command line.
 type Config struct {
@@ -110,6 +122,10 @@ type Config struct {
 	// "<host:port>/socks"; empty for the bare "proxy"/"socks" keyword
 	// form, which dials directly as before.
 	UpstreamAddr string
+	// ForwardAuth holds the -F <FORWARD> block: credentials presented to
+	// the upstream proxy/SOCKS server named by UpstreamAddr. Only
+	// meaningful (and only ever populated) when UpstreamAddr is non-empty.
+	ForwardAuth ForwardAuthConfig
 
 	// ClientTLS holds the -Q <SSL> block: gopr's own TLS/DTLS behavior when
 	// it acts as the client originating encryption toward Target (only

@@ -22,6 +22,20 @@ var keywordOrder = map[string]int{
 // the error returned when the positional argument count is wrong.
 const Usage = `gopr [option] <target> <listen>
 
+<target>                  ; normally <host:port>[/TCP|UDP][/SSL]; two more
+                          ; forms select proxy/socks mode instead of
+                          ; forwarding (see below)
+  [proxy | socks]         ; run <listen> as an HTTP proxy or SOCKS5 proxy
+                          ; instead of forwarding, dialing each client's
+                          ; requested destination directly. Cannot be
+                          ; combined with -Q/-Z/-M or any /TCP, /UDP, /SSL
+                          ; suffix.
+  [<host:port>/proxy]     ; same, but chain to an upstream HTTP proxy at
+  [<host:port>/socks]     ; <host:port> (matching kind: /proxy->HTTP proxy,
+                          ; /socks->SOCKS5) instead of dialing directly.
+                          ; Upstream TLS (i.e. an HTTPS proxy) is not
+                          ; supported; upstream auth is via -F below.
+
 [option]
   [-Q <SSL>]              ; SSL client option: TLS/DTLS origination toward
                           ; <target>. Requires <target>/SSL.
@@ -32,6 +46,12 @@ const Usage = `gopr [option] <target> <listen>
                           ; for TLS/DTLS termination on <listen>, instead
                           ; of -Z's static certificate. Requires
                           ; <listen>/SSL. Mutually exclusive with -Z.
+  [-F <FORWARD>]          ; forward-proxy auth option: credentials gopr
+                          ; presents to an upstream proxy/SOCKS server.
+                          ; Requires <target> to be a chained upstream
+                          ; (<host:port>/proxy or <host:port>/socks), not
+                          ; the bare "proxy"/"socks" keyword. Unrelated to
+                          ; -Q/-Z/-M (plain proxy-protocol auth, not TLS).
   [-d | -dd | -ddd]       ; debug output; each additional d prints one more,
                           ; less severe tier of diagnostics (socat-style):
                           ; -d = connection/session lifecycle, -dd = adds
@@ -64,7 +84,13 @@ const Usage = `gopr [option] <target> <listen>
                           ; optional) when <listen>/UDP/SSL is active, since
                           ; DTLS clients don't reliably send SNI
   [-ca=<path>]            ; same as -Z's -ca= (mTLS)
-  [-verify=<value>]       ; same as -Z's -verify=`
+  [-verify=<value>]       ; same as -Z's -verify=
+
+<FORWARD>                 ; sub-option of -F
+  [-user=<user:pass>]     ; username/password presented to the upstream
+                          ; proxy/SOCKS server (HTTP Basic auth, or SOCKS5
+                          ; username/password subnegotiation). Required
+                          ; when -F is given; user must be non-empty.`
 
 // ParseAll builds one Config per "--"-separated group of arguments in args.
 // "gopr A -- B" behaves like running "gopr A" and "gopr B" concurrently as
@@ -153,13 +179,27 @@ func Parse(args []string) (*Config, error) {
 		if err != nil {
 			return nil, err
 		}
+		var auth ForwardAuthConfig
+		if opts.f.seen {
+			if upstream == "" {
+				return nil, errors.New("-F requires chaining to an upstream proxy/socks server (<host:port>/proxy or <host:port>/socks), not the bare \"proxy\"/\"socks\" keyword")
+			}
+			if !opts.f.userSeen {
+				return nil, errors.New("-F requires -user=<user:pass>")
+			}
+			auth = ForwardAuthConfig{User: opts.f.user, Pass: opts.f.pass}
+		}
 		return &Config{
 			Mode:         mode,
 			Listen:       Endpoint{Addr: addr, TCP: true},
 			UpstreamAddr: upstream,
+			ForwardAuth:  auth,
 			LogLevel:     opts.logLevel,
 			Verbose:      opts.verbose,
 		}, nil
+	}
+	if opts.f.seen {
+		return nil, errors.New("-F is only valid with upstream proxy/socks chaining (<host:port>/proxy or <host:port>/socks)")
 	}
 
 	target, err := parseEndpoint(targetTok, true)
@@ -240,12 +280,23 @@ type mitmScope struct {
 	seen                           bool
 }
 
+// forwardAuthScope accumulates the -user= sub-option given under a -F
+// block: credentials for an upstream proxy/SOCKS server, unrelated to TLS.
+type forwardAuthScope struct {
+	user, pass string
+	// userSeen reports whether -user= was given inside this block; -F
+	// without it is an error (see Parse).
+	userSeen bool
+	seen     bool
+}
+
 // options holds every -flag= gopr accepts, before the target/listen
 // positional arguments have been parsed.
 type options struct {
-	q sslScope  // -Q <SSL>: TLS/DTLS origination toward <target>
-	z sslScope  // -Z <SSL>: static TLS/DTLS termination on <listen>
-	m mitmScope // -M <MITM>: generated-certificate termination on <listen>
+	q sslScope         // -Q <SSL>: TLS/DTLS origination toward <target>
+	z sslScope         // -Z <SSL>: static TLS/DTLS termination on <listen>
+	m mitmScope        // -M <MITM>: generated-certificate termination on <listen>
+	f forwardAuthScope // -F <FORWARD>: upstream proxy/SOCKS auth
 
 	help, version bool
 	// logLevel is the highest of any -d/-dd/-ddd given (0 if none), per
@@ -275,6 +326,7 @@ const (
 	scopeQ
 	scopeZ
 	scopeM
+	scopeF
 )
 
 // extractOptions consumes leading option tokens (any order) and returns the
@@ -328,6 +380,12 @@ func extractOptions(args []string) (options, []string, error) {
 			}
 			opts.m.seen = true
 			scope = scopeM
+		case tok == "-F":
+			if opts.f.seen {
+				return options{}, nil, errors.New("-F specified more than once")
+			}
+			opts.f.seen = true
+			scope = scopeF
 		case strings.HasPrefix(tok, "-key="):
 			val := strings.TrimPrefix(tok, "-key=")
 			switch scope {
@@ -409,6 +467,20 @@ func extractOptions(args []string) (options, []string, error) {
 				return options{}, nil, errors.New("-M -servername= specified more than once")
 			}
 			opts.m.serverName = strings.TrimPrefix(tok, "-servername=")
+		case strings.HasPrefix(tok, "-user="):
+			if scope != scopeF {
+				return options{}, nil, errors.New("-user= requires -F before it")
+			}
+			if opts.f.userSeen {
+				return options{}, nil, errors.New("-F -user= specified more than once")
+			}
+			val := strings.TrimPrefix(tok, "-user=")
+			user, pass, ok := strings.Cut(val, ":")
+			if !ok || user == "" {
+				return options{}, nil, fmt.Errorf("-F -user=%q must be in the form user:pass with a non-empty user", val)
+			}
+			opts.f.user, opts.f.pass = user, pass
+			opts.f.userSeen = true
 		default:
 			return opts, args[i:], nil
 		}

@@ -28,7 +28,9 @@ For the full, formal command-line grammar (used as the implementation spec),
   the same relay.
 - **IPv4, IPv6, and hostname** addressing, with a bare port shorthand for
   listen addresses (`8888` → `0.0.0.0:8888`).
-- **HTTP proxy** and **SOCKS5 proxy** modes as alternatives to forwarding.
+- **HTTP proxy** and **SOCKS5 proxy** modes as alternatives to forwarding,
+  with optional **`-F -user=` authentication** to an upstream proxy/SOCKS
+  server when chained.
 - **Multiple targets in one invocation**, separated by `--`, all running
   concurrently in a single process.
 - **`-verify=0`** (under `-Q`/`-Z`/`-M`) to skip certificate verification
@@ -60,6 +62,20 @@ Builds are done via the Gradle wrapper.
 ```
 gopr [option] <target> <listen>
 
+<target>                  ; normally <host:port>[/TCP|UDP][/SSL]; two more
+                          ; forms select proxy/socks mode instead of
+                          ; forwarding (see "proxy / socks modes" below)
+  [proxy | socks]         ; run <listen> as an HTTP proxy or SOCKS5 proxy
+                          ; instead of forwarding, dialing each client's
+                          ; requested destination directly. Cannot be
+                          ; combined with -Q/-Z/-M or any /TCP, /UDP, /SSL
+                          ; suffix.
+  [<host:port>/proxy]     ; same, but chain to an upstream HTTP proxy at
+  [<host:port>/socks]     ; <host:port> (matching kind: /proxy->HTTP proxy,
+                          ; /socks->SOCKS5) instead of dialing directly.
+                          ; Upstream TLS (i.e. an HTTPS proxy) is not
+                          ; supported; upstream auth is via -F below.
+
 [option]
   [-Q <SSL>]              ; SSL client option: TLS/DTLS origination toward
                           ; <target>. Requires <target>/SSL.
@@ -71,6 +87,12 @@ gopr [option] <target> <listen>
                           ; instead of -Z's static certificate. Requires
                           ; <listen>/SSL; TCP only. Mutually exclusive
                           ; with -Z.
+  [-F <FORWARD>]          ; forward-proxy auth option: credentials presented
+                          ; to an upstream proxy/SOCKS server. Requires
+                          ; chained upstream mode (<host:port>/proxy or
+                          ; <host:port>/socks), not the bare keyword form.
+                          ; Unrelated to -Q/-Z/-M (plain proxy-protocol
+                          ; auth, not TLS).
   [-d | -dd | -ddd]      ; debug output, each extra d prints
                          ; one more, less severe tier of diagnostics.
   [-v]                   ; dump the relayed data content to stderr,
@@ -97,18 +119,25 @@ gopr [option] <target> <listen>
                           ; overrides the client's SNI
   [-ca=<path>]            ; same as -Z's -ca= (mTLS)
   [-verify=<value>]       ; same as -Z's -verify=
+
+<FORWARD>                 ; sub-option of -F
+  [-user=<user:pass>]     ; username/password presented to the upstream
+                          ; proxy/SOCKS server (HTTP Basic auth, or SOCKS5
+                          ; username/password subnegotiation). Required
+                          ; when -F is given; user must be non-empty.
 ```
 
 - The two positional arguments are always `<target>` then `<listen>` (the
   forwarding destination, then the local address to listen on).
-- `-Q`, `-Z`, and `-M` each open a block, at most once apiece, that every
-  following `-key=`/`-cert=`/`-ca=`/`-verify=` (under `-Q`/`-Z`) or
-  `-signca=`/`-servername=`/`-ca=`/`-verify=` (under `-M`) belongs to, until
-  the next `-Q`/`-Z`/`-M` token or the first positional argument. These
-  sub-options cannot appear before any block has been opened. `-d`/`-dd`/
-  `-ddd`/`-v`/`-help`/`-version` are global and don't affect block scope.
-- Options must appear before the positional arguments; `-Q`/`-Z`/`-M` blocks
-  may appear in any order, and are all optional.
+- `-Q`, `-Z`, `-M`, and `-F` each open a block, at most once apiece, that
+  every following `-key=`/`-cert=`/`-ca=`/`-verify=` (under `-Q`/`-Z`),
+  `-signca=`/`-servername=`/`-ca=`/`-verify=` (under `-M`), or `-user=`
+  (under `-F`) belongs to, until the next `-Q`/`-Z`/`-M`/`-F` token or the
+  first positional argument. These sub-options cannot appear before any
+  block has been opened. `-d`/`-dd`/`-ddd`/`-v`/`-help`/`-version` are
+  global and don't affect block scope.
+- Options must appear before the positional arguments; `-Q`/`-Z`/`-M`/`-F`
+  blocks may appear in any order, and are all optional.
 - `-help` / `-version` print their respective output and exit immediately,
   ignoring any positional arguments; `-help` wins if both are given.
 
@@ -269,6 +298,12 @@ gopr 192.0.2.11:7777/proxy 8888
 # SOCKS5 proxy on 8888, chained to an upstream SOCKS proxy (192.0.2.11:7777)
 gopr 192.0.2.11:7777/socks 8888
 
+# HTTP proxy on 8888, chained to an upstream HTTP proxy that requires auth
+gopr -F -user=alice:s3cret 192.0.2.11:7777/proxy 8888
+
+# SOCKS5 proxy on 8888, chained to an upstream SOCKS proxy that requires auth
+gopr -F -user=alice:s3cret 192.0.2.11:7777/socks 8888
+
 # Two relays from one process (see "Multiple targets" above)
 gopr 192.0.2.11:7777 8888 -- 192.0.2.11:5555 6666
 
@@ -289,6 +324,8 @@ gopr -version
 | `-verify=<value>` (under `-Q`/`-Z`/`-M`) | `verify=0`: under `-Q`, skip verifying the target's certificate; under `-Z`/`-M`, still require a client certificate but skip verifying it against `-ca=` | Optional, defaults to verifying |
 | `-signca=<path>` (under `-M`) | CA (cert + private key) used to mint a leaf certificate per connection for TLS termination | Required under `-M` |
 | `-servername=<value>` (under `-M`) | Hostname for the generated certificate; defaults to the connection's SNI | Only meaningful with `-signca=` |
+| `-F` | Opens the forward-proxy auth block: credentials for an upstream proxy/SOCKS server | Optional; requires chained upstream mode (`<host:port>/proxy` or `<host:port>/socks`) |
+| `-user=<user:pass>` (under `-F`) | Username/password presented to the upstream proxy/SOCKS server | Required under `-F`; user must be non-empty |
 | `-d` / `-dd` / `-ddd` | Debug output, `-d` adds connection/session lifecycle notices, `-dd` adds per-connection detail and byte counts, `-ddd` adds per-chunk/per-packet trace | Optional, defaults to errors only |
 | `-v` | Dump the actual data relayed between target and listen to stderr, independent of `-d` | Optional |
 | `-help` | Print usage and exit | — |
@@ -325,11 +362,35 @@ gopr 192.0.2.11:7777/socks 8888
 - The same restrictions as the bare keyword form apply: no `-Q`/`-Z`/`-M`
   (or their sub-options) or `/tcp`/`/udp`/`/ssl` suffixes (`-d`/`-dd`/`-ddd`/
   `-v` remain usable).
-- Authentication (HTTP Basic, SOCKS5 username/password) and TLS to the
-  upstream (i.e. an HTTPS proxy) are not supported yet; the upstream is
-  assumed to be unauthenticated and unencrypted.
+- TLS to the upstream (i.e. an HTTPS proxy) is not supported; the
+  connection to the upstream itself is always plaintext.
 - SOCKS chaining still only supports CONNECT, matching the existing SOCKS
   server implementation (no BIND, no UDP ASSOCIATE).
+
+### Authenticating to an upstream proxy (`-F -user=`)
+
+When chained to an upstream proxy/SOCKS server that requires
+authentication, `-F -user=<user:pass>` supplies the credentials:
+
+```bash
+gopr -F -user=alice:s3cret 192.0.2.11:7777/proxy 8888
+gopr -F -user=alice:s3cret 192.0.2.11:7777/socks 8888
+```
+
+- `-F` is only valid alongside chained upstream mode (`<host:port>/proxy` or
+  `<host:port>/socks`); it's an error with the bare `proxy`/`socks` keyword
+  (no upstream to authenticate to) or in plain forwarding mode.
+- For an HTTP proxy upstream, the credentials are sent as an HTTP Basic
+  `Proxy-Authorization` header. For a SOCKS upstream, they're sent via the
+  SOCKS5 username/password subnegotiation (RFC 1929).
+- `-F` is deliberately separate from `-Q`/`-Z`/`-M`: those are TLS-specific,
+  while `-F` is plain proxy-protocol authentication, unrelated to
+  encryption. `-F` is reserved specifically for the upstream (target) side;
+  authenticating clients connecting to gopr's own listening proxy is not
+  yet supported.
+- `user` must be non-empty; `pass` may be empty (`-user=alice:`). A literal
+  `:` in the password is fine — only the first `:` in `-user=` is treated
+  as the separator.
 
 ## Limitations
 

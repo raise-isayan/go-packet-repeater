@@ -28,6 +28,7 @@ func RunSOCKS(ctx context.Context, cfg *config.Config) error {
 	log := logx.New(logx.Level(cfg.LogLevel), cfg.Verbose)
 	addr := cfg.Listen.Addr
 	upstream := cfg.UpstreamAddr
+	auth := cfg.ForwardAuth
 
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -53,7 +54,7 @@ func RunSOCKS(ctx context.Context, cfg *config.Config) error {
 				return err
 			}
 		}
-		go handleSOCKSConn(conn, log, upstream)
+		go handleSOCKSConn(conn, log, upstream, auth)
 	}
 }
 
@@ -61,7 +62,10 @@ const (
 	socksVersion5 = 0x05
 
 	socksAuthNone           = 0x00
+	socksAuthUserPass       = 0x02
 	socksAuthNoAcceptable   = 0xFF
+	socksUserPassVersion    = 0x01
+	socksUserPassSuccess    = 0x00
 	socksCmdConnect         = 0x01
 	socksAtypIPv4           = 0x01
 	socksAtypDomain         = 0x03
@@ -72,7 +76,7 @@ const (
 	socksReplyAtypNotSupp   = 0x08
 )
 
-func handleSOCKSConn(conn net.Conn, log *logx.Logger, upstream string) {
+func handleSOCKSConn(conn net.Conn, log *logx.Logger, upstream string, auth config.ForwardAuthConfig) {
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(30 * time.Second))
 
@@ -93,7 +97,7 @@ func handleSOCKSConn(conn net.Conn, log *logx.Logger, upstream string) {
 
 	var dst net.Conn
 	if upstream != "" {
-		dst, err = dialUpstreamSOCKS(upstream, target)
+		dst, err = dialUpstreamSOCKS(upstream, target, auth)
 	} else {
 		dst, err = net.DialTimeout("tcp", target, 10*time.Second)
 	}
@@ -231,9 +235,10 @@ type halfCloser interface {
 // CONNECT request for target ("host:port"), returning the established
 // connection once the upstream reports success. Used by handleSOCKSConn
 // when gopr's own SOCKS proxy is chained to an upstream one
-// (cfg.UpstreamAddr). Only "no authentication" is offered, matching
-// RunSOCKS's own server-side support.
-func dialUpstreamSOCKS(upstream, target string) (net.Conn, error) {
+// (cfg.UpstreamAddr). When auth is unset, only "no authentication" is
+// offered, matching RunSOCKS's own server-side support; when set, only
+// username/password (RFC 1929) is offered and negotiated.
+func dialUpstreamSOCKS(upstream, target string, auth config.ForwardAuthConfig) (net.Conn, error) {
 	conn, err := net.DialTimeout("tcp", upstream, 10*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("dial upstream socks %s: %w", upstream, err)
@@ -241,7 +246,11 @@ func dialUpstreamSOCKS(upstream, target string) (net.Conn, error) {
 	conn.SetDeadline(time.Now().Add(10 * time.Second))
 	defer conn.SetDeadline(time.Time{})
 
-	if _, err := conn.Write([]byte{socksVersion5, 1, socksAuthNone}); err != nil {
+	wantMethod := byte(socksAuthNone)
+	if auth.User != "" {
+		wantMethod = socksAuthUserPass
+	}
+	if _, err := conn.Write([]byte{socksVersion5, 1, wantMethod}); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("upstream socks %s: write greeting: %w", upstream, err)
 	}
@@ -250,9 +259,34 @@ func dialUpstreamSOCKS(upstream, target string) (net.Conn, error) {
 		conn.Close()
 		return nil, fmt.Errorf("upstream socks %s: read greeting response: %w", upstream, err)
 	}
-	if methodResp[0] != socksVersion5 || methodResp[1] != socksAuthNone {
+	if methodResp[0] != socksVersion5 || methodResp[1] != wantMethod {
 		conn.Close()
 		return nil, fmt.Errorf("upstream socks %s: no acceptable authentication method (server chose %d)", upstream, methodResp[1])
+	}
+
+	if wantMethod == socksAuthUserPass {
+		if len(auth.User) > 255 || len(auth.Pass) > 255 {
+			conn.Close()
+			return nil, fmt.Errorf("upstream socks %s: -F -user= username/password must each be at most 255 bytes", upstream)
+		}
+		req := make([]byte, 0, 3+len(auth.User)+len(auth.Pass))
+		req = append(req, socksUserPassVersion, byte(len(auth.User)))
+		req = append(req, auth.User...)
+		req = append(req, byte(len(auth.Pass)))
+		req = append(req, auth.Pass...)
+		if _, err := conn.Write(req); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("upstream socks %s: write username/password: %w", upstream, err)
+		}
+		authResp := make([]byte, 2)
+		if _, err := io.ReadFull(conn, authResp); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("upstream socks %s: read username/password response: %w", upstream, err)
+		}
+		if authResp[1] != socksUserPassSuccess {
+			conn.Close()
+			return nil, fmt.Errorf("upstream socks %s: username/password authentication failed (status %d)", upstream, authResp[1])
+		}
 	}
 
 	host, portStr, err := net.SplitHostPort(target)
