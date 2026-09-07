@@ -4,9 +4,11 @@ package proxy
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -28,7 +30,9 @@ import (
 // dialed directly: a CONNECT is issued to the upstream for tunneled
 // requests, and plain requests are sent via an http.Transport configured
 // with the upstream as its Proxy. cfg.ForwardAuth (-F -user=), when set,
-// presents HTTP Basic credentials to that upstream proxy.
+// presents credentials to that upstream proxy: HTTP Basic preemptively, and
+// Digest (RFC 2617) if the upstream challenges with a 407 asking for it --
+// see upstreamAuthTransport and dialUpstreamConnect.
 func RunHTTP(ctx context.Context, cfg *config.Config) error {
 	log := logx.New(logx.Level(cfg.LogLevel), cfg.Verbose)
 	addr := cfg.Listen.Addr
@@ -38,10 +42,12 @@ func RunHTTP(ctx context.Context, cfg *config.Config) error {
 	transport := http.DefaultTransport
 	if upstream != "" {
 		proxyURL := &url.URL{Scheme: "http", Host: upstream}
+		inner := &http.Transport{Proxy: http.ProxyURL(proxyURL)}
 		if auth.User != "" {
-			proxyURL.User = url.UserPassword(auth.User, auth.Pass)
+			transport = &upstreamAuthTransport{inner: inner, auth: auth}
+		} else {
+			transport = inner
 		}
-		transport = &http.Transport{Proxy: http.ProxyURL(proxyURL)}
 	}
 
 	srv := &http.Server{
@@ -178,15 +184,112 @@ func handleForward(w http.ResponseWriter, r *http.Request, log *logx.Logger, tra
 	logx.Copy(log, label, false, w, resp.Body)
 }
 
+// upstreamAuthTransport wraps an http.RoundTripper that sends plain
+// (non-CONNECT) requests through an upstream HTTP proxy (see RunHTTP),
+// presenting auth's credentials to that proxy: Basic preemptively, and
+// Digest (RFC 2617) if the upstream instead challenges a request with a 407
+// -- the same handshake dialUpstreamConnect performs for CONNECT tunnels.
+// Go's http.Transport has no built-in support for Digest proxy auth, so
+// this drives the challenge/response itself.
+type upstreamAuthTransport struct {
+	inner http.RoundTripper
+	auth  config.ForwardAuthConfig
+}
+
+func (t *upstreamAuthTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	var bodyBytes []byte
+	if req.Body != nil && req.Body != http.NoBody {
+		var err error
+		bodyBytes, err = io.ReadAll(req.Body)
+		req.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("upstream proxy auth: read request body: %w", err)
+		}
+	}
+	cloneWithBody := func() *http.Request {
+		clone := req.Clone(req.Context())
+		if bodyBytes != nil {
+			clone.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		}
+		return clone
+	}
+
+	req1 := cloneWithBody()
+	creds := base64.StdEncoding.EncodeToString([]byte(t.auth.User + ":" + t.auth.Pass))
+	req1.Header.Set("Proxy-Authorization", "Basic "+creds)
+
+	resp, err := t.inner.RoundTrip(req1)
+	if err != nil || resp.StatusCode != http.StatusProxyAuthRequired {
+		return resp, err
+	}
+	ch, ok := findDigestChallenge(resp.Header.Values("Proxy-Authenticate"))
+	if !ok {
+		return resp, nil
+	}
+	resp.Body.Close()
+
+	digestHeader, err := buildDigestAuthorization(ch, req.Method, req.URL.String(), t.auth.User, t.auth.Pass)
+	if err != nil {
+		return nil, fmt.Errorf("upstream proxy auth: %w", err)
+	}
+	req2 := cloneWithBody()
+	req2.Header.Set("Proxy-Authorization", digestHeader)
+	return t.inner.RoundTrip(req2)
+}
+
 // dialUpstreamConnect dials upstream (an HTTP proxy address) and issues an
 // HTTP CONNECT request for targetHost, returning the tunneled connection
 // once the upstream reports success. Used by handleConnect when gopr's own
 // HTTP proxy is chained to an upstream one (cfg.UpstreamAddr). When auth is
-// set, a Proxy-Authorization: Basic header is included.
+// set, a Proxy-Authorization: Basic header is presented preemptively; if the
+// upstream instead responds 407 with a Digest challenge, the CONNECT is
+// retried once on a fresh connection with a computed Digest response.
 func dialUpstreamConnect(upstream, targetHost string, auth config.ForwardAuthConfig) (net.Conn, error) {
+	authHeader := ""
+	if auth.User != "" {
+		creds := base64.StdEncoding.EncodeToString([]byte(auth.User + ":" + auth.Pass))
+		authHeader = "Basic " + creds
+	}
+
+	conn, resp, err := connectAttempt(upstream, targetHost, authHeader)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode == http.StatusOK {
+		return conn, nil
+	}
+	conn.Conn.Close()
+
+	if resp.StatusCode != http.StatusProxyAuthRequired || auth.User == "" {
+		return nil, fmt.Errorf("upstream proxy %s: CONNECT %s: %s", upstream, targetHost, resp.Status)
+	}
+	ch, ok := findDigestChallenge(resp.Header.Values("Proxy-Authenticate"))
+	if !ok {
+		return nil, fmt.Errorf("upstream proxy %s: CONNECT %s: %s", upstream, targetHost, resp.Status)
+	}
+	digestHeader, err := buildDigestAuthorization(ch, http.MethodConnect, targetHost, auth.User, auth.Pass)
+	if err != nil {
+		return nil, fmt.Errorf("upstream proxy %s: %w", upstream, err)
+	}
+
+	conn, resp, err = connectAttempt(upstream, targetHost, digestHeader)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		conn.Conn.Close()
+		return nil, fmt.Errorf("upstream proxy %s: CONNECT %s: %s", upstream, targetHost, resp.Status)
+	}
+	return conn, nil
+}
+
+// connectAttempt dials upstream and issues a single HTTP CONNECT request for
+// targetHost, presenting authHeader (if non-empty) as Proxy-Authorization.
+// The caller must close the returned connection unless the response is 200.
+func connectAttempt(upstream, targetHost, authHeader string) (*bufferedConn, *http.Response, error) {
 	conn, err := net.DialTimeout("tcp", upstream, 10*time.Second)
 	if err != nil {
-		return nil, fmt.Errorf("dial upstream proxy %s: %w", upstream, err)
+		return nil, nil, fmt.Errorf("dial upstream proxy %s: %w", upstream, err)
 	}
 
 	req := &http.Request{
@@ -195,34 +298,25 @@ func dialUpstreamConnect(upstream, targetHost string, auth config.ForwardAuthCon
 		Host:   targetHost,
 		Header: make(http.Header),
 	}
-	if auth.User != "" {
-		creds := base64.StdEncoding.EncodeToString([]byte(auth.User + ":" + auth.Pass))
-		req.Header.Set("Proxy-Authorization", "Basic "+creds)
+	if authHeader != "" {
+		req.Header.Set("Proxy-Authorization", authHeader)
 	}
 	if err := req.Write(conn); err != nil {
 		conn.Close()
-		return nil, fmt.Errorf("upstream proxy %s: write CONNECT: %w", upstream, err)
+		return nil, nil, fmt.Errorf("upstream proxy %s: write CONNECT: %w", upstream, err)
 	}
 
 	br := bufio.NewReader(conn)
 	resp, err := http.ReadResponse(br, req)
 	if err != nil {
 		conn.Close()
-		return nil, fmt.Errorf("upstream proxy %s: read CONNECT response: %w", upstream, err)
+		return nil, nil, fmt.Errorf("upstream proxy %s: read CONNECT response: %w", upstream, err)
 	}
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		conn.Close()
-		return nil, fmt.Errorf("upstream proxy %s: CONNECT %s: %s", upstream, targetHost, resp.Status)
-	}
-
-	if br.Buffered() > 0 {
-		// The bufio.Reader used to parse the CONNECT response may have
-		// read ahead into the start of the tunneled stream; preserve
-		// those bytes instead of dropping them.
-		return &bufferedConn{Conn: conn, r: br}, nil
-	}
-	return conn, nil
+	// The bufio.Reader used to parse the CONNECT response may have read
+	// ahead into the start of the tunneled stream; preserve those bytes
+	// instead of dropping them.
+	return &bufferedConn{Conn: conn, r: br}, resp, nil
 }
 
 // bufferedConn wraps a net.Conn whose initial bytes have already been

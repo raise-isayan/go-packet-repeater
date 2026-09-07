@@ -380,9 +380,14 @@ gopr -F -user=alice:s3cret 192.0.2.11:7777/socks 8888
 - `-F` is only valid alongside chained upstream mode (`<host:port>/proxy` or
   `<host:port>/socks`); it's an error with the bare `proxy`/`socks` keyword
   (no upstream to authenticate to) or in plain forwarding mode.
-- For an HTTP proxy upstream, the credentials are sent as an HTTP Basic
-  `Proxy-Authorization` header. For a SOCKS upstream, they're sent via the
-  SOCKS5 username/password subnegotiation (RFC 1929).
+- For an HTTP proxy upstream, the credentials are first sent as an HTTP
+  Basic `Proxy-Authorization` header. If the upstream instead responds
+  `407 Proxy Authentication Required` with a `Proxy-Authenticate: Digest`
+  challenge, gopr computes a Digest (RFC 2617, `qop=auth`, algorithm `MD5`
+  or `MD5-sess`) response from that challenge and retries once with
+  `Proxy-Authorization: Digest`. For a SOCKS upstream, credentials are sent
+  via the SOCKS5 username/password subnegotiation (RFC 1929), which has no
+  Digest equivalent.
 - `-F` is deliberately separate from `-Q`/`-Z`/`-M`: those are TLS-specific,
   while `-F` is plain proxy-protocol authentication, unrelated to
   encryption. `-F` is reserved specifically for the upstream (target) side;

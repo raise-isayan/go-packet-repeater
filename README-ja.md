@@ -301,7 +301,7 @@ gopr -F -user=alice:s3cret 192.0.2.11:7777/socks 8888
 ```
 
 - `-F`は上位チェーン形式(`<host:port>/proxy`または`<host:port>/socks`)でのみ有効。単独の`proxy`/`socks`キーワード(上位なし)や通常の転送モードと組み合わせるとエラーになる。
-- 上位がHTTPプロキシの場合、認証情報はHTTP Basic認証の`Proxy-Authorization`ヘッダーとして送信される。上位がSOCKSサーバーの場合は、SOCKS5ユーザー名/パスワードサブネゴシエーション(RFC 1929)で送信される。
+- 上位がHTTPプロキシの場合、まずHTTP Basic認証の`Proxy-Authorization`ヘッダーとして送信される。上位が`407 Proxy Authentication Required`を`Proxy-Authenticate: Digest`付きで返した場合は、そのチャレンジからDigest認証(RFC 2617、`qop=auth`、アルゴリズムは`MD5`/`MD5-sess`)のレスポンスを計算し、`Proxy-Authorization: Digest`で1回だけ再試行する。上位がSOCKSサーバーの場合は、SOCKS5ユーザー名/パスワードサブネゴシエーション(RFC 1929)で送信される(SOCKS5にDigest相当の仕組みは無い)。
 - `-F`は`-Q`/`-Z`/`-M`とは意図的に別系統にしてある: これらはTLS専用オプションだが、`-F`はTLSとは無関係な素のプロキシプロトコル認証である。`-F`は上位(target側)への認証専用で、gopr自身が待ち受けるプロキシへ接続してくるクライアント側の認証は現時点では未対応。
 - `user`は空文字不可。`pass`は空でもよい(`-user=alice:`)。パスワードに`:`を含めても問題ない — `-user=`内で区切りとして扱われるのは最初の`:`のみ。
 
