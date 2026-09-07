@@ -30,7 +30,10 @@ For the full, formal command-line grammar (used as the implementation spec),
   listen addresses (`8888` → `0.0.0.0:8888`).
 - **HTTP proxy** and **SOCKS5 proxy** modes as alternatives to forwarding,
   with optional **`-F -user=` authentication** to an upstream proxy/SOCKS
-  server when chained.
+  server when chained, and an independent **`listen`-side `/proxy`/`/socks`
+  suffix to convert between the two wire protocols** (e.g. serve SOCKS to
+  clients while dialing out — directly or via an upstream — as an HTTP
+  proxy, or vice versa).
 - **Multiple targets in one invocation**, separated by `--`, all running
   concurrently in a single process.
 - **`-verify=0`** (under `-Q`/`-Z`/`-M`) to skip certificate verification
@@ -68,13 +71,14 @@ gopr [option] <target> <listen>
   [proxy | socks]         ; run <listen> as an HTTP proxy or SOCKS5 proxy
                           ; instead of forwarding, dialing each client's
                           ; requested destination directly. Cannot be
-                          ; combined with -Q/-Z/-M or any /TCP, /UDP, /SSL
-                          ; suffix.
-  [<host:port>/proxy]     ; same, but chain to an upstream HTTP proxy at
-  [<host:port>/socks]     ; <host:port> (matching kind: /proxy->HTTP proxy,
-                          ; /socks->SOCKS5) instead of dialing directly.
-                          ; Upstream TLS (i.e. an HTTPS proxy) is not
-                          ; supported; upstream auth is via -F below.
+                          ; combined with -Q/-Z/-M. <listen> may carry a
+                          ; "/proxy" or "/socks" suffix of its own (see
+                          ; "Frontend/backend conversion" below); no other
+                          ; suffix (/TCP, /UDP, /SSL) is allowed.
+  [<host:port>/proxy]     ; same, but chain to an upstream HTTP proxy or
+  [<host:port>/socks]     ; SOCKS5 server at <host:port> instead of dialing
+                          ; directly. Upstream TLS (i.e. an HTTPS proxy) is
+                          ; not supported; upstream auth is via -F below.
 
 [option]
   [-Q <SSL>]              ; SSL client option: TLS/DTLS origination toward
@@ -304,6 +308,12 @@ gopr -F -user=alice:s3cret 192.0.2.11:7777/proxy 8888
 # SOCKS5 proxy on 8888, chained to an upstream SOCKS proxy that requires auth
 gopr -F -user=alice:s3cret 192.0.2.11:7777/socks 8888
 
+# HTTP proxy on 8888, chained to an upstream SOCKS proxy (frontend/backend conversion)
+gopr 192.0.2.11:7777/socks 8888/proxy
+
+# SOCKS5 proxy on 8888, chained to an upstream HTTP proxy (frontend/backend conversion)
+gopr 192.0.2.11:7777/proxy 8888/socks
+
 # Two relays from one process (see "Multiple targets" above)
 gopr 192.0.2.11:7777 8888 -- 192.0.2.11:5555 6666
 
@@ -338,17 +348,19 @@ casing, e.g. `PROXY`), with no port, `listen` is used as the address for an
 HTTP proxy or SOCKS5 proxy, respectively, and normal forwarding is bypassed
 entirely. These modes cannot be combined with `-Q`/`-Z`/`-M` (or their
 sub-options) or any `/tcp`, `/udp`, `/ssl` suffix (`-d`/`-dd`/`-ddd`/`-v`
-remain usable).
+remain usable). `listen` may itself carry a `/proxy` or `/socks` suffix —
+see "Frontend/backend conversion" below.
 
 ### Chaining to an upstream proxy (`<host:port>/proxy`, `<host:port>/socks`)
 
 Giving `target` as `<host:port>/proxy` or `<host:port>/socks` instead of the
-bare keyword chains the proxy to an upstream server of the same kind
-instead of dialing each client's requested destination directly: `/proxy`
-relays through an upstream HTTP proxy, `/socks` through an upstream SOCKS5
-server. The upstream is always the same kind as the local listen mode —
-there's no syntax for mixing (e.g. an HTTP proxy chaining to an upstream
-SOCKS server).
+bare keyword chains the proxy to an upstream server instead of dialing each
+client's requested destination directly: `/proxy` relays through an
+upstream HTTP proxy, `/socks` through an upstream SOCKS5 server. Without an
+explicit `/proxy` or `/socks` suffix on `listen`, the local listen mode
+matches the upstream's kind, same as before; giving `listen` a differing
+suffix converts between the two wire protocols instead — see "Frontend/backend
+conversion" below.
 
 ```bash
 # HTTP proxy on 8888, chained to an upstream HTTP proxy
@@ -366,6 +378,50 @@ gopr 192.0.2.11:7777/socks 8888
   connection to the upstream itself is always plaintext.
 - SOCKS chaining still only supports CONNECT, matching the existing SOCKS
   server implementation (no BIND, no UDP ASSOCIATE).
+
+### Frontend/backend conversion (`listen`'s `/proxy`, `/socks` suffix)
+
+`listen` may also carry a single `/proxy` or `/socks` suffix of its own.
+This selects the wire protocol `listen` speaks to clients (the
+"frontend"), independently of whatever `target` says to dial with (the
+"backend": direct dialing, or chained to an upstream via `<host:port>/proxy`
+or `<host:port>/socks`). When they match — including when `listen`'s suffix
+is simply omitted — behavior is unchanged from before; when they differ,
+gopr converts between the HTTP-proxy and SOCKS wire protocols:
+
+```bash
+gopr socks 8888/proxy                   # serve HTTP proxy on 8888, dial directly
+gopr proxy 8888/socks                   # serve SOCKS5 on 8888, dial directly
+
+gopr proxy 8888/proxy                   # same as: gopr proxy 8888
+gopr socks 8888/socks                   # same as: gopr socks 8888
+
+gopr 192.0.2.11:7777/socks 8888/proxy   # serve HTTP proxy on 8888, chained to an upstream SOCKS server
+gopr 192.0.2.11:7777/proxy 8888/socks   # serve SOCKS5 on 8888, chained to an upstream HTTP proxy
+```
+
+- `target` must still be given in one of its usual proxy/socks forms (bare
+  keyword or `<host:port>/proxy`/`<host:port>/socks`); `listen`'s `/proxy`/
+  `/socks` suffix is only recognized alongside one of those, and can't be
+  combined with `/tcp`/`/udp`/`/ssl`.
+- Same casing policy as the `proxy`/`socks` keyword: `listen`'s suffix must
+  be all-uppercase or all-lowercase as a token, independently of `target`'s
+  own casing.
+- A tunneled request (HTTP CONNECT or a SOCKS CONNECT) is received in the
+  frontend's protocol and dialed out in the backend's (directly, or via an
+  HTTP-CONNECT or SOCKS5-CONNECT upstream chain), then relayed byte-for-byte
+  either way.
+- A plain (non-CONNECT) HTTP request arriving on an HTTP-proxy frontend
+  chained to a SOCKS backend is still forwarded as an HTTP request — SOCKS
+  itself only ever expresses a raw CONNECT-style tunnel, so gopr opens that
+  tunnel to the destination (directly, or via the SOCKS5 upstream) and
+  writes the HTTP request onto it, rather than rejecting it.
+- A SOCKS frontend only ever sends CONNECT-style requests to begin with, so
+  a `proxy`-kind backend behaves identically to a `socks`-kind one there —
+  it's just a different mechanism (HTTP CONNECT vs. SOCKS5 CONNECT) for
+  reaching the same destination.
+- `-F -user=` authenticates to the backend (`target`'s kind), independent of
+  the frontend.
 
 ### Authenticating to an upstream proxy (`-F -user=`)
 

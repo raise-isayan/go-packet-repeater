@@ -21,13 +21,21 @@ import (
 // relaying use case. cfg.LogLevel/cfg.Verbose select diagnostic detail and
 // data dumping (-d/-v), same as forwarding mode.
 //
-// When cfg.UpstreamAddr is set (<target> was "<host:port>/socks"), every
-// accepted CONNECT is relayed through that upstream SOCKS5 server (see
-// dialUpstreamSOCKS) instead of being dialed directly.
+// When cfg.UpstreamAddr is set (<target> was "<host:port>/proxy" or
+// "<host:port>/socks"), every accepted CONNECT is relayed through that
+// upstream proxy/SOCKS server instead of being dialed directly, chosen by
+// cfg.UpstreamKind: ModeSOCKSProxy issues a SOCKS5 CONNECT to the upstream
+// (see dialUpstreamSOCKS), ModeHTTPProxy an HTTP CONNECT instead (see
+// dialUpstreamConnect in http.go). This lets <listen> speak the SOCKS wire
+// protocol to clients while <target> chains to an HTTP-proxy backend,
+// converting between the two (SKILL.md's "Proxy変換");
+// cfg.UpstreamKind == ModeSOCKSProxy reproduces the original,
+// non-converting behavior.
 func RunSOCKS(ctx context.Context, cfg *config.Config) error {
 	log := logx.New(logx.Level(cfg.LogLevel), cfg.Verbose)
 	addr := cfg.Listen.Addr
 	upstream := cfg.UpstreamAddr
+	backendKind := cfg.UpstreamKind
 	auth := cfg.ForwardAuth
 
 	ln, err := net.Listen("tcp", addr)
@@ -40,7 +48,11 @@ func RunSOCKS(ctx context.Context, cfg *config.Config) error {
 	}()
 
 	if upstream != "" {
-		log.Print("socks proxy: listening on %s, forwarding via upstream socks %s", addr, upstream)
+		kind := "socks"
+		if backendKind == config.ModeHTTPProxy {
+			kind = "proxy"
+		}
+		log.Print("socks proxy: listening on %s, forwarding via upstream %s %s", addr, kind, upstream)
 	} else {
 		log.Print("socks proxy: listening on %s", addr)
 	}
@@ -54,7 +66,7 @@ func RunSOCKS(ctx context.Context, cfg *config.Config) error {
 				return err
 			}
 		}
-		go handleSOCKSConn(conn, log, upstream, auth)
+		go handleSOCKSConn(conn, log, upstream, backendKind, auth)
 	}
 }
 
@@ -76,7 +88,7 @@ const (
 	socksReplyAtypNotSupp   = 0x08
 )
 
-func handleSOCKSConn(conn net.Conn, log *logx.Logger, upstream string, auth config.ForwardAuthConfig) {
+func handleSOCKSConn(conn net.Conn, log *logx.Logger, upstream string, backendKind config.Mode, auth config.ForwardAuthConfig) {
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(30 * time.Second))
 
@@ -96,10 +108,13 @@ func handleSOCKSConn(conn net.Conn, log *logx.Logger, upstream string, auth conf
 	}
 
 	var dst net.Conn
-	if upstream != "" {
-		dst, err = dialUpstreamSOCKS(upstream, target, auth)
-	} else {
+	switch {
+	case upstream == "":
 		dst, err = net.DialTimeout("tcp", target, 10*time.Second)
+	case backendKind == config.ModeHTTPProxy:
+		dst, err = dialUpstreamConnect(upstream, target, auth)
+	default:
+		dst, err = dialUpstreamSOCKS(upstream, target, auth)
 	}
 	if err != nil {
 		log.Error("socks: %s: dial %s: %v", conn.RemoteAddr(), target, err)

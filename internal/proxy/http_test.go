@@ -3,15 +3,18 @@ package proxy
 import (
 	"bufio"
 	"encoding/base64"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
 	"time"
 
 	"gopr/internal/config"
+	"gopr/internal/logx"
 )
 
 func TestDialUpstreamConnectAuth(t *testing.T) {
@@ -62,6 +65,145 @@ func TestDialUpstreamConnectAuth(t *testing.T) {
 	t.Run("without credentials sends no auth header", func(t *testing.T) {
 		run(t, config.ForwardAuthConfig{}, "")
 	})
+}
+
+// startFakeSOCKSUpstreamEcho runs a minimal no-auth SOCKS5 server for one
+// connection: it accepts any CONNECT, replies "succeeded", then echoes
+// whatever bytes follow. Used to test handleConnect's
+// backendKind == config.ModeSOCKSProxy path (an HTTP-proxy frontend
+// chained to a SOCKS backend; see RunHTTP's "Proxy変換" doc comment).
+func startFakeSOCKSUpstreamEcho(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if !fakeSOCKSHandshakeAndConnect(conn, "", "", true) {
+			return
+		}
+		// A single bounded read/write, not an unbounded io.Copy: the test
+		// sends one message and expects it echoed back, then the caller's
+		// relay loop needs this side to actually close (sending a FIN) so
+		// its own EOF-driven teardown completes instead of hanging forever
+		// waiting for more data that will never come.
+		buf := make([]byte, 4096)
+		n, err := conn.Read(buf)
+		if err != nil {
+			return
+		}
+		conn.Write(buf[:n])
+	}()
+
+	return ln.Addr().String()
+}
+
+// startFakeSOCKSUpstreamHTTP runs a minimal no-auth SOCKS5 server for one
+// connection: it accepts any CONNECT, replies "succeeded", then reads one
+// HTTP request over the tunnel and replies with a canned 200 response.
+// Used to test newSOCKSBackedTransport, which must dial through it (rather
+// than connecting directly) when RunHTTP's plain (non-CONNECT) forwarding
+// is chained to a SOCKS backend.
+func startFakeSOCKSUpstreamHTTP(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if !fakeSOCKSHandshakeAndConnect(conn, "", "", true) {
+			return
+		}
+		req, err := http.ReadRequest(bufio.NewReader(conn))
+		if err != nil {
+			return
+		}
+		req.Body.Close()
+		conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"))
+	}()
+
+	return ln.Addr().String()
+}
+
+// TestHandleConnectBackendKindSOCKS exercises RunHTTP's frontend/backend
+// conversion (SKILL.md "Proxy変換"): an HTTP-proxy client CONNECTs to
+// handleConnect as always, but backendKind == config.ModeSOCKSProxy routes
+// the tunnel through an upstream SOCKS server (dialUpstreamSOCKS) instead
+// of an upstream HTTP proxy, proven end-to-end by round-tripping real bytes
+// through the whole chain.
+func TestHandleConnectBackendKindSOCKS(t *testing.T) {
+	upstream := startFakeSOCKSUpstreamEcho(t)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handleConnect(w, r, logx.New(0, false), upstream, config.ModeSOCKSProxy, config.ForwardAuthConfig{})
+	}))
+	defer srv.Close()
+
+	conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	fmt.Fprintf(conn, "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodConnect})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	if _, err := conn.Write([]byte("ping")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatal(err)
+	}
+	if string(buf) != "ping" {
+		t.Fatalf("echoed = %q, want %q", buf, "ping")
+	}
+}
+
+// TestSOCKSBackedTransport confirms newSOCKSBackedTransport actually routes
+// through the given upstream SOCKS server rather than dialing directly:
+// example.com is unreachable in the test sandbox, so a real HTTP round trip
+// only succeeds by going through startFakeSOCKSUpstreamHTTP.
+func TestSOCKSBackedTransport(t *testing.T) {
+	upstream := startFakeSOCKSUpstreamHTTP(t)
+	transport := newSOCKSBackedTransport(upstream, config.ForwardAuthConfig{})
+
+	req, err := http.NewRequest(http.MethodGet, "http://example.com/path", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "ok" {
+		t.Fatalf("body = %q, want %q", body, "ok")
+	}
 }
 
 // digestChallengeResponse is a canned 407 response offering Digest auth,

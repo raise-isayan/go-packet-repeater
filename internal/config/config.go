@@ -114,17 +114,30 @@ type Config struct {
 	Listen Endpoint
 
 	// UpstreamAddr, when non-empty, chains this proxy to an upstream
-	// proxy/SOCKS server of the same kind instead of dialing the client's
-	// requested destination directly: an HTTP CONNECT (or plain request)
-	// is relayed through it in ModeHTTPProxy, and a SOCKS5 CONNECT in
-	// ModeSOCKSProxy. Only set when Mode is ModeHTTPProxy or
-	// ModeSOCKSProxy and <target> was given as "<host:port>/proxy" or
-	// "<host:port>/socks"; empty for the bare "proxy"/"socks" keyword
-	// form, which dials directly as before.
+	// proxy/SOCKS server (of the kind named by UpstreamKind) instead of
+	// dialing the client's requested destination directly. Only set when
+	// Mode is ModeHTTPProxy or ModeSOCKSProxy and <target> was given as
+	// "<host:port>/proxy" or "<host:port>/socks"; empty for the bare
+	// "proxy"/"socks" keyword form, which dials directly as before.
 	UpstreamAddr string
+	// UpstreamKind selects which proxy protocol is used on the "backend"
+	// side of a proxy/socks relay: an HTTP CONNECT (or plain request) when
+	// ModeHTTPProxy, a SOCKS5 CONNECT when ModeSOCKSProxy -- applied both
+	// to UpstreamAddr (which protocol it's chained through) and, when
+	// UpstreamAddr is empty, conceptually to the direct dial (which has no
+	// observable protocol-specific behavior either way). Taken from
+	// <target>'s own "proxy"/"socks" keyword or "<host:port>/proxy"/
+	// "<host:port>/socks" chain suffix, independent of Mode (the
+	// "frontend" wire protocol <listen> speaks to clients). Equal to Mode
+	// unless <listen> carries a differing "/proxy" or "/socks" suffix,
+	// which converts between the two wire protocols -- see SKILL.md's
+	// "Proxy変換". Only meaningful when Mode is ModeHTTPProxy or
+	// ModeSOCKSProxy.
+	UpstreamKind Mode
 	// ForwardAuth holds the -F <FORWARD> block: credentials presented to
-	// the upstream proxy/SOCKS server named by UpstreamAddr. Only
-	// meaningful (and only ever populated) when UpstreamAddr is non-empty.
+	// the upstream proxy/SOCKS server named by UpstreamAddr (of the
+	// protocol named by UpstreamKind). Only meaningful (and only ever
+	// populated) when UpstreamAddr is non-empty.
 	ForwardAuth ForwardAuthConfig
 
 	// ClientTLS holds the -Q <SSL> block: gopr's own TLS/DTLS behavior when

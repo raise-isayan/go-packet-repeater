@@ -467,6 +467,134 @@ func TestParseProxyModes(t *testing.T) {
 	})
 }
 
+func TestParseProxyConversion(t *testing.T) {
+	t.Run("bare proxy with matching listen suffix is same as bare form", func(t *testing.T) {
+		cfg, err := Parse([]string{"proxy", "8888/proxy"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.Mode != ModeHTTPProxy || cfg.UpstreamKind != ModeHTTPProxy || cfg.UpstreamAddr != "" {
+			t.Errorf("cfg = %+v, want Mode=UpstreamKind=ModeHTTPProxy, UpstreamAddr empty", cfg)
+		}
+		if cfg.Listen.Addr != "0.0.0.0:8888" {
+			t.Errorf("Listen.Addr = %q, want 0.0.0.0:8888", cfg.Listen.Addr)
+		}
+	})
+
+	t.Run("bare socks with matching listen suffix is same as bare form", func(t *testing.T) {
+		cfg, err := Parse([]string{"socks", "8888/socks"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.Mode != ModeSOCKSProxy || cfg.UpstreamKind != ModeSOCKSProxy || cfg.UpstreamAddr != "" {
+			t.Errorf("cfg = %+v, want Mode=UpstreamKind=ModeSOCKSProxy, UpstreamAddr empty", cfg)
+		}
+	})
+
+	t.Run("bare socks target with proxy listen converts frontend to HTTP", func(t *testing.T) {
+		cfg, err := Parse([]string{"socks", "8888/proxy"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.Mode != ModeHTTPProxy {
+			t.Errorf("Mode = %v, want ModeHTTPProxy (frontend from <listen>)", cfg.Mode)
+		}
+		if cfg.UpstreamKind != ModeSOCKSProxy {
+			t.Errorf("UpstreamKind = %v, want ModeSOCKSProxy (backend from <target>)", cfg.UpstreamKind)
+		}
+		if cfg.UpstreamAddr != "" {
+			t.Errorf("UpstreamAddr = %q, want empty (bare keyword, no chain)", cfg.UpstreamAddr)
+		}
+	})
+
+	t.Run("bare proxy target with socks listen converts frontend to SOCKS", func(t *testing.T) {
+		cfg, err := Parse([]string{"proxy", "8888/socks"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.Mode != ModeSOCKSProxy {
+			t.Errorf("Mode = %v, want ModeSOCKSProxy (frontend from <listen>)", cfg.Mode)
+		}
+		if cfg.UpstreamKind != ModeHTTPProxy {
+			t.Errorf("UpstreamKind = %v, want ModeHTTPProxy (backend from <target>)", cfg.UpstreamKind)
+		}
+	})
+
+	t.Run("uppercase listen suffix", func(t *testing.T) {
+		cfg, err := Parse([]string{"socks", "8888/PROXY"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.Mode != ModeHTTPProxy {
+			t.Errorf("Mode = %v, want ModeHTTPProxy", cfg.Mode)
+		}
+	})
+
+	t.Run("mixed-case listen suffix is an error", func(t *testing.T) {
+		if _, err := Parse([]string{"socks", "8888/Proxy"}); err == nil {
+			t.Fatal("expected error: mixed-case 'Proxy' listen suffix is not recognized")
+		}
+	})
+
+	t.Run("listen suffix combined with another suffix is an error", func(t *testing.T) {
+		if _, err := Parse([]string{"socks", "8888/tcp/proxy"}); err == nil {
+			t.Fatal("expected error: /proxy cannot combine with /tcp on listen")
+		}
+	})
+
+	t.Run("upstream HTTP proxy chain with SOCKS listen converts frontend", func(t *testing.T) {
+		cfg, err := Parse([]string{"192.0.2.11:7777/proxy", "8888/socks"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.Mode != ModeSOCKSProxy {
+			t.Errorf("Mode = %v, want ModeSOCKSProxy (frontend from <listen>)", cfg.Mode)
+		}
+		if cfg.UpstreamKind != ModeHTTPProxy {
+			t.Errorf("UpstreamKind = %v, want ModeHTTPProxy (backend from <target>)", cfg.UpstreamKind)
+		}
+		if cfg.UpstreamAddr != "192.0.2.11:7777" {
+			t.Errorf("UpstreamAddr = %q, want 192.0.2.11:7777", cfg.UpstreamAddr)
+		}
+	})
+
+	t.Run("upstream SOCKS chain with proxy listen converts frontend", func(t *testing.T) {
+		cfg, err := Parse([]string{"192.0.2.11:7777/socks", "8888/proxy"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.Mode != ModeHTTPProxy {
+			t.Errorf("Mode = %v, want ModeHTTPProxy (frontend from <listen>)", cfg.Mode)
+		}
+		if cfg.UpstreamKind != ModeSOCKSProxy {
+			t.Errorf("UpstreamKind = %v, want ModeSOCKSProxy (backend from <target>)", cfg.UpstreamKind)
+		}
+		if cfg.UpstreamAddr != "192.0.2.11:7777" {
+			t.Errorf("UpstreamAddr = %q, want 192.0.2.11:7777", cfg.UpstreamAddr)
+		}
+	})
+
+	t.Run("upstream chain with matching listen suffix is same as omitting it", func(t *testing.T) {
+		cfg, err := Parse([]string{"192.0.2.11:7777/socks", "8888/socks"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.Mode != ModeSOCKSProxy || cfg.UpstreamKind != ModeSOCKSProxy {
+			t.Errorf("cfg = %+v, want Mode=UpstreamKind=ModeSOCKSProxy", cfg)
+		}
+	})
+
+	t.Run("-F applies to the chained backend regardless of listen frontend", func(t *testing.T) {
+		cfg, err := Parse([]string{"-F", "-user=alice:s3cret", "192.0.2.11:7777/socks", "8888/proxy"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.ForwardAuth.User != "alice" || cfg.ForwardAuth.Pass != "s3cret" {
+			t.Errorf("ForwardAuth = %+v, want User=alice Pass=s3cret", cfg.ForwardAuth)
+		}
+	})
+}
+
 func TestParseForwardAuth(t *testing.T) {
 	t.Run("HTTP proxy chain with -F -user=", func(t *testing.T) {
 		cfg, err := Parse([]string{"-F", "-user=alice:s3cret", "192.0.2.11:7777/proxy", "8888"})

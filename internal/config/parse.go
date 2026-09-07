@@ -28,13 +28,27 @@ const Usage = `gopr [option] <target> <listen>
   [proxy | socks]         ; run <listen> as an HTTP proxy or SOCKS5 proxy
                           ; instead of forwarding, dialing each client's
                           ; requested destination directly. Cannot be
-                          ; combined with -Q/-Z/-M or any /TCP, /UDP, /SSL
-                          ; suffix.
-  [<host:port>/proxy]     ; same, but chain to an upstream HTTP proxy at
-  [<host:port>/socks]     ; <host:port> (matching kind: /proxy->HTTP proxy,
-                          ; /socks->SOCKS5) instead of dialing directly.
-                          ; Upstream TLS (i.e. an HTTPS proxy) is not
-                          ; supported; upstream auth is via -F below.
+                          ; combined with -Q/-Z/-M. <listen> may carry a
+                          ; "/proxy" or "/socks" suffix of its own (see
+                          ; below); no other suffix (/TCP, /UDP, /SSL) is
+                          ; allowed.
+  [<host:port>/proxy]     ; same, but chain to an upstream HTTP proxy or
+  [<host:port>/socks]     ; SOCKS5 server at <host:port> instead of dialing
+                          ; directly. Upstream TLS (i.e. an HTTPS proxy) is
+                          ; not supported; upstream auth is via -F below.
+
+<listen>                  ; normally <port>[/TCP|UDP][/SSL]; in proxy/socks
+                          ; mode (<target> above), <port> may instead carry
+                          ; a "/proxy" or "/socks" suffix of its own,
+                          ; selecting which wire protocol <listen> speaks to
+                          ; clients. Omitted, it matches <target>'s own
+                          ; protocol (as before this existed). Given and
+                          ; differing from <target>'s protocol, it converts
+                          ; between HTTP-proxy and SOCKS wire protocols:
+                          ; <listen> serves the protocol it names, while
+                          ; <target> still determines how the request is
+                          ; ultimately dialed (directly, or chained per
+                          ; <target>'s own form above).
 
 [option]
   [-Q <SSL>]              ; SSL client option: TLS/DTLS origination toward
@@ -172,10 +186,14 @@ func Parse(args []string) (*Config, error) {
 		if opts.q.seen || opts.z.seen || opts.m.seen {
 			return nil, errors.New("proxy/socks mode cannot be combined with -Q/-Z/-M")
 		}
-		if strings.Contains(listenTok, "/") {
-			return nil, fmt.Errorf("proxy/socks mode cannot be combined with protocol suffixes: %q", listenTok)
+		listenAddrTok, frontendMode, hasFrontendSuffix, serr := splitProxyListenSuffix(listenTok)
+		if serr != nil {
+			return nil, serr
 		}
-		addr, err := normalizeAddr(listenTok, false)
+		if !hasFrontendSuffix {
+			frontendMode = mode
+		}
+		addr, err := normalizeAddr(listenAddrTok, false)
 		if err != nil {
 			return nil, err
 		}
@@ -190,9 +208,10 @@ func Parse(args []string) (*Config, error) {
 			auth = ForwardAuthConfig{User: opts.f.user, Pass: opts.f.pass}
 		}
 		return &Config{
-			Mode:         mode,
+			Mode:         frontendMode,
 			Listen:       Endpoint{Addr: addr, TCP: true},
 			UpstreamAddr: upstream,
+			UpstreamKind: mode,
 			ForwardAuth:  auth,
 			LogLevel:     opts.logLevel,
 			Verbose:      opts.verbose,
@@ -510,16 +529,48 @@ func matchKeyword(tok, word string) bool {
 	return tok == strings.ToUpper(word) || tok == strings.ToLower(word)
 }
 
+// splitProxyListenSuffix splits a <listen> token used with proxy/socks mode
+// into its address and an optional single "/proxy" or "/socks" suffix
+// (case-consistent, per matchKeyword). That suffix selects which wire
+// protocol <listen> speaks to clients -- the "frontend" -- which may differ
+// from <target>'s own protocol (returned separately by classifyProxyTarget
+// as its Mode result) -- the "backend": how the request is ultimately
+// dialed, whether directly or chained via "<host:port>/proxy" or
+// "<host:port>/socks". A mismatch between the two converts between the
+// HTTP-proxy and SOCKS wire protocols; see SKILL.md's "Proxy変換". No
+// other suffix (e.g. /TCP, /UDP, /SSL) is valid here.
+//
+// hasSuffix is false (and frontendMode is meaningless) when tok carries no
+// suffix at all, in which case the caller should use <target>'s own
+// protocol as the frontend too, exactly as before this feature existed.
+func splitProxyListenSuffix(tok string) (addrTok string, frontendMode Mode, hasSuffix bool, err error) {
+	idx := strings.IndexByte(tok, '/')
+	if idx < 0 {
+		return tok, 0, false, nil
+	}
+	addrTok, suffix := tok[:idx], tok[idx+1:]
+	if strings.Contains(suffix, "/") {
+		return "", 0, false, fmt.Errorf("proxy/socks <listen> suffix must be a single /proxy or /socks: %q", tok)
+	}
+	m, matched := proxyMode(suffix)
+	if !matched {
+		return "", 0, false, fmt.Errorf("unknown <listen> suffix %q in %q (expected /proxy or /socks)", suffix, tok)
+	}
+	return addrTok, m, true, nil
+}
+
 // classifyProxyTarget reports whether targetTok selects proxy/socks mode,
 // in either of two forms:
 //
 //   - the bare keyword ("proxy" / "socks", see proxyMode): dial each
 //     client's requested destination directly, no upstream.
 //   - "<host:port>/proxy" or "<host:port>/socks": chain to the given
-//     upstream proxy/SOCKS server instead of dialing directly. The
-//     upstream is always the same kind as the local listen mode (an
-//     HTTP proxy chains only to an upstream HTTP proxy, SOCKS only to
-//     upstream SOCKS) -- there is no syntax for mixing kinds.
+//     upstream proxy/SOCKS server instead of dialing directly.
+//
+// The returned Mode is targetTok's own protocol -- the "backend" -- which
+// <listen> may request a different "frontend" wire protocol from via its
+// own "/proxy"/"/socks" suffix (see splitProxyListenSuffix) to convert
+// between the two.
 //
 // ok reports whether targetTok matched either form at all; when it does
 // but the upstream address is invalid, ok is still true and err explains

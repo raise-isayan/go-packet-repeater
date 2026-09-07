@@ -25,22 +25,37 @@ import (
 // cfg.LogLevel/cfg.Verbose select diagnostic detail and data dumping (-d/-v),
 // same as forwarding mode.
 //
-// When cfg.UpstreamAddr is set (<target> was "<host:port>/proxy"), every
-// request is relayed through that upstream HTTP proxy instead of being
-// dialed directly: a CONNECT is issued to the upstream for tunneled
-// requests, and plain requests are sent via an http.Transport configured
-// with the upstream as its Proxy. cfg.ForwardAuth (-F -user=), when set,
-// presents credentials to that upstream proxy: HTTP Basic preemptively, and
-// Digest (RFC 2617) if the upstream challenges with a 407 asking for it --
-// see upstreamAuthTransport and dialUpstreamConnect.
+// When cfg.UpstreamAddr is set (<target> was "<host:port>/proxy" or
+// "<host:port>/socks"), every request is relayed through that upstream
+// proxy/SOCKS server instead of being dialed directly, chosen by
+// cfg.UpstreamKind: ModeHTTPProxy issues a CONNECT to the upstream for
+// tunneled requests and sends plain requests via an http.Transport
+// configured with the upstream as its Proxy; ModeSOCKSProxy instead
+// establishes a SOCKS5 CONNECT to the upstream (see dialUpstreamSOCKS) for
+// both tunneled and plain requests -- the latter via socksBackedTransport,
+// since a plain (non-CONNECT) HTTP forward has no SOCKS equivalent of its
+// own. This lets <listen> speak the HTTP-proxy wire protocol to clients
+// while <target> chains to a SOCKS backend, converting between the two
+// (SKILL.md's "Proxy変換"); cfg.UpstreamKind == ModeHTTPProxy reproduces the
+// original, non-converting behavior. cfg.ForwardAuth (-F -user=), when set,
+// presents credentials to that upstream: HTTP Basic preemptively and Digest
+// (RFC 2617) on a 407 challenge for an HTTP-proxy upstream (see
+// upstreamAuthTransport and dialUpstreamConnect), or SOCKS5
+// username/password (RFC 1929) for a SOCKS upstream (see dialUpstreamSOCKS).
 func RunHTTP(ctx context.Context, cfg *config.Config) error {
 	log := logx.New(logx.Level(cfg.LogLevel), cfg.Verbose)
 	addr := cfg.Listen.Addr
 	upstream := cfg.UpstreamAddr
+	backendKind := cfg.UpstreamKind
 	auth := cfg.ForwardAuth
 
-	transport := http.DefaultTransport
-	if upstream != "" {
+	var transport http.RoundTripper
+	switch {
+	case upstream == "":
+		transport = http.DefaultTransport
+	case backendKind == config.ModeSOCKSProxy:
+		transport = newSOCKSBackedTransport(upstream, auth)
+	default:
 		proxyURL := &url.URL{Scheme: "http", Host: upstream}
 		inner := &http.Transport{Proxy: http.ProxyURL(proxyURL)}
 		if auth.User != "" {
@@ -54,7 +69,7 @@ func RunHTTP(ctx context.Context, cfg *config.Config) error {
 		Addr: addr,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method == http.MethodConnect {
-				handleConnect(w, r, log, upstream, auth)
+				handleConnect(w, r, log, upstream, backendKind, auth)
 				return
 			}
 			handleForward(w, r, log, transport)
@@ -69,7 +84,11 @@ func RunHTTP(ctx context.Context, cfg *config.Config) error {
 	}()
 
 	if upstream != "" {
-		log.Print("http proxy: listening on %s, forwarding via upstream proxy %s", addr, upstream)
+		kind := "proxy"
+		if backendKind == config.ModeSOCKSProxy {
+			kind = "socks"
+		}
+		log.Print("http proxy: listening on %s, forwarding via upstream %s %s", addr, kind, upstream)
 	} else {
 		log.Print("http proxy: listening on %s", addr)
 	}
@@ -80,21 +99,43 @@ func RunHTTP(ctx context.Context, cfg *config.Config) error {
 	return err
 }
 
+// newSOCKSBackedTransport returns an http.RoundTripper for RunHTTP's plain
+// (non-CONNECT) forwarding when chained through an upstream SOCKS5 server
+// (cfg.UpstreamKind == ModeSOCKSProxy) instead of an HTTP proxy. It behaves
+// like http.DefaultTransport -- dialing the destination named by each
+// request's own URL, no separate proxy hop -- except that dial goes through
+// dialUpstreamSOCKS's CONNECT to upstream rather than a direct net.Dial;
+// Proxy is explicitly cleared since DefaultTransport otherwise defaults it
+// to http.ProxyFromEnvironment, which would be a second, unwanted proxy hop
+// layered on top.
+func newSOCKSBackedTransport(upstream string, auth config.ForwardAuthConfig) *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.Proxy = nil
+	t.DialContext = func(_ context.Context, _, addr string) (net.Conn, error) {
+		return dialUpstreamSOCKS(upstream, addr, auth)
+	}
+	return t
+}
+
 // handleConnect tunnels an HTTPS (or other TCP) connection through a
 // CONNECT request without decrypting it. When upstream is non-empty, the
-// tunnel is established via an upstream HTTP proxy (see dialUpstreamConnect)
-// instead of dialing r.Host directly, presenting auth's credentials if set.
-func handleConnect(w http.ResponseWriter, r *http.Request, log *logx.Logger, upstream string, auth config.ForwardAuthConfig) {
+// tunnel is established via an upstream proxy/SOCKS server instead of
+// dialing r.Host directly, chosen by backendKind (see RunHTTP) and
+// presenting auth's credentials if set.
+func handleConnect(w http.ResponseWriter, r *http.Request, log *logx.Logger, upstream string, backendKind config.Mode, auth config.ForwardAuthConfig) {
 	label := fmt.Sprintf("http-connect %s", r.Host)
 	log.Warn("%s: request from %s", label, r.RemoteAddr)
 	start := time.Now()
 
 	var dst net.Conn
 	var err error
-	if upstream != "" {
-		dst, err = dialUpstreamConnect(upstream, r.Host, auth)
-	} else {
+	switch {
+	case upstream == "":
 		dst, err = net.DialTimeout("tcp", r.Host, 10*time.Second)
+	case backendKind == config.ModeSOCKSProxy:
+		dst, err = dialUpstreamSOCKS(upstream, r.Host, auth)
+	default:
+		dst, err = dialUpstreamConnect(upstream, r.Host, auth)
 	}
 	if err != nil {
 		log.Error("http-connect: %s: dial: %v", r.Host, err)
